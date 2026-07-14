@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo build *)",
+      "Bash(curl -s -A \"Mozilla/5.0 \\(X11; Linux x86_64\\) AppleWebKit/537.36 \\(KHTML, like Gecko\\) Chrome/124.0.0.0 Safari/537.36\" \"https://letterboxd.com/films/popular/\")",
+      "Bash(curl -s -A \"Mozilla/5.0 \\(X11; Linux x86_64\\) AppleWebKit/537.36 \\(KHTML, like Gecko\\) Chrome/124.0.0.0 Safari/537.36\" \"https://letterboxd.com/csi/films/films-browser-list/popular/?esiAllowFilters=true\")",
+      "Bash(curl -s -A \"Mozilla/5.0 \\(X11; Linux x86_64\\) AppleWebKit/537.36 \\(KHTML, like Gecko\\) Chrome/124.0.0.0 Safari/537.36\" -H \"Accept: text/html,application/xhtml+xml\" -H \"Accept-Language: en-US,en;q=0.9\" \"https://letterboxd.com/csi/films/films-browser-list/popular/?esiAllowFilters=true\")",
+      "Bash(curl -s -A \"Mozilla/5.0 \\(X11; Linux x86_64\\) AppleWebKit/537.36\" \"https://letterboxd.com/csi/films/films-browser-list/popular/this/month/?esiAllowFilters=true\")",
+      "Bash(curl -s -A \"Mozilla/5.0 \\(X11; Linux x86_64\\) AppleWebKit/537.36\" \"https://letterboxd.com/csi/films/films-browser-list/popular/this/week/?esiAllowFilters=true\")",
+      "Bash(curl -s -A \"Mozilla/5.0 \\(X11; Linux x86_64\\) AppleWebKit/537.36\" \"https://letterboxd.com/csi/films/films-browser-list/new/?esiAllowFilters=true\")",
+      "Bash(curl -s -A \"Mozilla/5.0 \\(X11; Linux x86_64\\) AppleWebKit/537.36\" \"https://letterboxd.com/csi/films/films-browser-list/popular/?esiAllowFilters=true\")",
+      "Bash(curl -s \"https://letterboxd.com/film/interstellar/json/\")",
+      "Bash(curl -s -A \"Mozilla/5.0 \\(X11; Linux x86_64\\) AppleWebKit/537.36\" \"https://letterboxd.com/csi/films/films-browser-list/rated/?esiAllowFilters=true\")",
+      "Bash(echo \"---status: $?\")",
+      "Bash(curl -s -A \"Mozilla/5.0 \\(X11; Linux x86_64\\) AppleWebKit/537.36\" \"https://letterboxd.com/films/rated/\")",
+      "Bash(curl -s -A \"Mozilla/5.0 \\(X11; Linux x86_64\\) AppleWebKit/537.36\" \"https://letterboxd.com/csi/films/films-browser-list/top250/?esiAllowFilters=true\")",
+      "Bash(curl -s -A \"Mozilla/5.0 \\(X11; Linux x86_64\\) AppleWebKit/537.36\" \"https://letterboxd.com/csi/films/films-browser-list/by/rating/?esiAllowFilters=true\")",
+      "Bash(curl -s -A \"Mozilla/5.0 \\(X11; Linux x86_64\\) AppleWebKit/537.36\" \"https://letterboxd.com/csi/films/films-browser-list/by/rating/genre/drama/?esiAllowFilters=true\")",
+      "Bash(curl -s -A \"Mozilla/5.0 \\(X11; Linux x86_64\\) AppleWebKit/537.36\" \"https://letterboxd.com/films/top250/\")",
+      "Bash(curl -s -A \"Mozilla/5.0 \\(X11; Linux x86_64\\) AppleWebKit/537.36\" \"https://letterboxd.com/csi/films/films-browser-list/top250/size/small/?esiAllowFilters=true\")",
+      "Bash(curl -s -A \"Mozilla/5.0 \\(X11; Linux x86_64\\) AppleWebKit/537.36\" \"https://letterboxd.com/csi/films/films-browser-list/by/rating/?esiAllowFilters=true&type=film\")",
+      "Bash(curl -s -A \"Mozilla/5.0 \\(X11; Linux x86_64\\) AppleWebKit/537.36\" -H \"Accept: text/html\" \"https://letterboxd.com/films/popular/genre/action/\")",
+      "Bash(curl -s -A \"Mozilla/5.0 \\(X11; Linux x86_64\\) AppleWebKit/537.36\" \"https://letterboxd.com/csi/films/films-browser-list/by/rating/decade/2020s/?esiAllowFilters=true\")"
+    ]
+  },
+  "prefersReducedMotion": false
+}

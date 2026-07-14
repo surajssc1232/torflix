@@ -1,0 +1,316 @@
+mod app;
+mod letterboxd;
+mod omdb;
+mod rqbit;
+mod search;
+mod ui;
+
+use anyhow::Result;
+use app::{App, View};
+use letterboxd::ListKind;
+use crossterm::{
+    event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use ratatui::{backend::CrosstermBackend, Terminal};
+use rqbit::Client;
+use std::io;
+use std::path::PathBuf;
+use std::time::Duration;
+
+fn purge_stale_temp_dirs() {
+    let tmp = std::env::temp_dir();
+    if let Ok(entries) = std::fs::read_dir(&tmp) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("torflix-") && entry.path().is_dir() {
+                std::fs::remove_dir_all(entry.path()).ok();
+            }
+        }
+    }
+}
+
+fn download_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("TORFLIX_DOWNLOAD_DIR") {
+        return PathBuf::from(dir);
+    }
+    dirs::video_dir()
+        .or_else(dirs::download_dir)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("torflix")
+}
+
+fn main() -> Result<()> {
+    let api_url =
+        std::env::var("TORFLIX_RQBIT_URL").unwrap_or_else(|_| rqbit::DEFAULT_API.to_string());
+    let client = Client::new(&api_url);
+
+    // Start a local rqbit engine if none is running.
+    let mut engine_child = None;
+    if !client.is_up() {
+        eprintln!("starting rqbit engine (downloads -> {}) ...", download_dir().display());
+        let child = rqbit::spawn_engine(&download_dir())?;
+        engine_child = Some(child);
+        let mut ok = false;
+        for _ in 0..40 {
+            std::thread::sleep(Duration::from_millis(250));
+            if client.is_up() {
+                ok = true;
+                break;
+            }
+        }
+        if !ok {
+            if let Some(mut c) = engine_child {
+                let _ = c.kill();
+            }
+            anyhow::bail!("rqbit engine did not come up on {}", api_url);
+        }
+    }
+
+    // Clean up any temp dirs left behind by a previous crash.
+    purge_stale_temp_dirs();
+
+    let mut app = App::new(client);
+    app.spawn_poller();
+    app.browse_popular(ListKind::PopularThisWeek); // open popular view on boot
+
+    // Add anything passed on the command line (magnet, URL, or .torrent path).
+    for arg in std::env::args().skip(1) {
+        if arg.starts_with('-') {
+            continue;
+        }
+        let label = arg.clone();
+        app.add_and_play_async(&arg, &label);
+    }
+
+    // Terminal setup with panic-safe restore.
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableBracketedPaste);
+        default_hook(info);
+    }));
+
+    let res = run(&mut terminal, &mut app);
+
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableBracketedPaste)?;
+    terminal.show_cursor()?;
+
+    if app.stop_engine_on_quit {
+        if let Some(mut c) = engine_child {
+            let _ = c.kill();
+            let _ = c.wait();
+            println!("rqbit engine stopped.");
+        } else {
+            println!("note: the rqbit engine was already running before torflix; leaving it alone.");
+        }
+    } else if engine_child.is_some() {
+        println!(
+            "rqbit engine left running so downloads/streams continue (quit with Q to stop it)."
+        );
+    }
+
+    res
+}
+
+fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
+    loop {
+        while let Ok(msg) = app.status_rx.try_recv() {
+            app.status = msg;
+        }
+
+        if app.view == View::Popular {
+            app.maybe_fetch_ratings();
+        } else if app.view == View::SearchResults {
+            app.maybe_fetch_search_ratings();
+        }
+
+        terminal.draw(|f| ui::draw(f, app))?;
+
+        if !event::poll(Duration::from_millis(250))? {
+            continue;
+        }
+        match event::read()? {
+            Event::Paste(text) => match app.view {
+                View::AddInput => app.input.push_str(&text),
+                View::SearchInput => app.search_query.push_str(&text),
+                _ => {}
+            },
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                let n_rows = app.rows_snapshot().len();
+                match app.view {
+                    View::AddInput => match key.code {
+                        KeyCode::Esc => {
+                            app.input.clear();
+                            app.view = View::Torrents;
+                        }
+                        KeyCode::Enter => app.submit_add(),
+                        KeyCode::Backspace => {
+                            app.input.pop();
+                        }
+                        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            app.input.clear();
+                        }
+                        KeyCode::Char(c) => app.input.push(c),
+                        _ => {}
+                    },
+                    View::SearchInput => match key.code {
+                        KeyCode::Esc => app.view = View::Torrents,
+                        KeyCode::Enter => app.start_search(),
+                        KeyCode::Backspace => {
+                            app.search_query.pop();
+                        }
+                        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            app.search_query.clear();
+                        }
+                        KeyCode::Char(c) => app.search_query.push(c),
+                        _ => {}
+                    },
+                    View::SearchResults => match key.code {
+                        KeyCode::Esc | KeyCode::Char('h') => app.view = app.search_origin.clone(),
+                        KeyCode::Char('q') => app.should_quit = true,
+                        KeyCode::Char('s') | KeyCode::Char('/') => {
+                            app.view = View::SearchInput;
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            app.search_selected = app.search_selected.saturating_sub(1);
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            let n = app.search_results_len();
+                            if n > 0 {
+                                app.search_selected = (app.search_selected + 1).min(n - 1);
+                            }
+                        }
+                        KeyCode::Enter | KeyCode::Char('l') => app.add_search_selected(),
+                        _ => {}
+                    },
+                    View::Popular => match key.code {
+                        KeyCode::Esc | KeyCode::Char('h') => {
+                            app.view = View::Torrents;
+                            app.status =
+                                "a: add magnet/URL  Enter: files  Space: pause  q: quit".into();
+                        }
+                        KeyCode::Char('q') => app.should_quit = true,
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            app.popular_selected = app.popular_selected.saturating_sub(1);
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            let n = app.popular_len();
+                            if n > 0 {
+                                app.popular_selected = (app.popular_selected + 1).min(n - 1);
+                            }
+                        }
+                        KeyCode::Enter | KeyCode::Char('l') => app.search_popular_selected(),
+                        // Tab / left-right to switch list kind
+                        KeyCode::Tab | KeyCode::Right | KeyCode::Char('L') => {
+                            let next = match app.popular_list {
+                                ListKind::Popular => ListKind::PopularThisWeek,
+                                ListKind::PopularThisWeek => ListKind::PopularThisMonth,
+                                ListKind::PopularThisMonth => ListKind::TopRated,
+                                ListKind::TopRated => ListKind::Popular,
+                            };
+                            app.browse_popular(next);
+                        }
+                        KeyCode::BackTab | KeyCode::Left | KeyCode::Char('H') => {
+                            let prev = match app.popular_list {
+                                ListKind::Popular => ListKind::TopRated,
+                                ListKind::PopularThisWeek => ListKind::Popular,
+                                ListKind::PopularThisMonth => ListKind::PopularThisWeek,
+                                ListKind::TopRated => ListKind::PopularThisMonth,
+                            };
+                            app.browse_popular(prev);
+                        }
+                        KeyCode::Char('r') => {
+                            let kind = match app.popular_list {
+                                ListKind::Popular => ListKind::Popular,
+                                ListKind::PopularThisWeek => ListKind::PopularThisWeek,
+                                ListKind::PopularThisMonth => ListKind::PopularThisMonth,
+                                ListKind::TopRated => ListKind::TopRated,
+                            };
+                            app.browse_popular(kind);
+                        }
+                        _ => {}
+                    },
+                    View::ConfirmDelete => match key.code {
+                        KeyCode::Char('y') | KeyCode::Char('Y') => app.confirm_delete(),
+                        _ => app.view = View::Torrents,
+                    },
+                    View::Files => match key.code {
+                        KeyCode::Esc | KeyCode::Char('h') | KeyCode::Backspace => {
+                            app.view = View::Torrents;
+                            app.status =
+                                "a: add magnet/URL  Enter: files  Space: pause  q: quit".into();
+                        }
+                        KeyCode::Char('q') => app.should_quit = true,
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            app.file_selected = app.file_selected.saturating_sub(1);
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            if !app.files.is_empty() {
+                                app.file_selected =
+                                    (app.file_selected + 1).min(app.files.len() - 1);
+                            }
+                        }
+                        KeyCode::Enter | KeyCode::Char('l') => app.play_selected_file(),
+                        KeyCode::Char('p') => app.play_playlist(),
+                        _ => {}
+                    },
+                    View::Torrents => match key.code {
+                        KeyCode::Char('q') => app.should_quit = true,
+                        KeyCode::Char('Q') => {
+                            app.stop_engine_on_quit = true;
+                            app.should_quit = true;
+                        }
+                        KeyCode::Char('a') => {
+                            app.input.clear();
+                            app.view = View::AddInput;
+                        }
+                        KeyCode::Char('s') | KeyCode::Char('/') => {
+                            app.search_query.clear();
+                            app.view = View::SearchInput;
+                        }
+                        KeyCode::Char('b') => app.browse_popular(ListKind::Popular),
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            app.selected = app.selected.saturating_sub(1);
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            if n_rows > 0 {
+                                app.selected = (app.selected + 1).min(n_rows - 1);
+                            }
+                        }
+                        KeyCode::Enter | KeyCode::Char('l') => app.open_files(),
+                        KeyCode::Char(' ') => app.toggle_pause(),
+                        KeyCode::Char('d') => {
+                            if n_rows > 0 {
+                                app.delete_with_files = false;
+                                app.view = View::ConfirmDelete;
+                            }
+                        }
+                        KeyCode::Char('D') => {
+                            if n_rows > 0 {
+                                app.delete_with_files = true;
+                                app.view = View::ConfirmDelete;
+                            }
+                        }
+                        _ => {}
+                    },
+                }
+                app.clamp_selection(app.rows_snapshot().len());
+            }
+            _ => {}
+        }
+
+        if app.should_quit {
+            return Ok(());
+        }
+    }
+}
