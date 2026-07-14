@@ -215,32 +215,14 @@ impl App {
     }
 
     fn launch_player(&mut self, url: &str, title: &str) {
-        let player_cmd =
-            std::env::var("TORFLIX_PLAYER").unwrap_or_else(|_| "mpv".to_string());
-        let mut parts = player_cmd.split_whitespace();
-        let bin = parts.next().unwrap_or("mpv");
-        let extra: Vec<&str> = parts.collect();
-
-        let mut cmd = Command::new(bin);
-        cmd.args(&extra);
-        if bin == "mpv" {
-            cmd.arg(format!("--force-media-title={}", title));
-        }
-        cmd.arg(url)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-
-        match cmd.spawn() {
-            Ok(_) => {
-                self.status = format!("▶ playing: {} — buffering may take a moment", title)
-            }
-            Err(e) => {
-                self.status = format!(
-                    "✗ couldn't launch '{}' ({}). Install mpv or set TORFLIX_PLAYER",
-                    bin, e
-                )
-            }
+        let Some(player_cmd) = find_player() else {
+            self.status =
+                "✗ no player found — install mpv or vlc, or set TORFLIX_PLAYER".into();
+            return;
+        };
+        match spawn_player(&player_cmd, url, title) {
+            Ok(_) => self.status = format!("▶ playing: {} — buffering may take a moment", title),
+            Err(e) => self.status = format!("✗ couldn't launch '{}': {}", player_cmd, e),
         }
     }
 
@@ -270,16 +252,35 @@ impl App {
         };
     }
 
-    /// Add torrent to a temp dir, stream the largest video in MPV,
-    /// then delete all downloaded pieces when MPV exits — nothing kept on disk.
+    /// Add a torrent and either stream it (if a player is available) or download it permanently.
     pub fn add_and_play_async(&mut self, target: &str, label: &str) {
         let client = self.client.clone();
         let tx = self.status_tx.clone();
         let target = target.to_string();
         let label = label.to_string();
-        let player_cmd =
-            std::env::var("TORFLIX_PLAYER").unwrap_or_else(|_| "mpv".to_string());
+
+        // Detect the player now — if none, fall back to permanent download.
+        let player_cmd = find_player();
+
+        if player_cmd.is_none() {
+            self.status = format!("⬇ adding: {} — no player found, downloading…", label);
+            thread::spawn(move || match client.add(&target) {
+                Ok(_) => {
+                    let _ = tx.send(format!(
+                        "⬇ downloading: {}  (install mpv or vlc to stream instead)",
+                        label
+                    ));
+                }
+                Err(e) => {
+                    let _ = tx.send(format!("✗ add failed: {}", e));
+                }
+            });
+            return;
+        }
+
+        let player_cmd = player_cmd.unwrap();
         self.status = format!("⧗ adding: {} …", label);
+
         thread::spawn(move || {
             // Unique temp dir so concurrent streams don't collide.
             let temp_dir = std::env::temp_dir().join(format!(
@@ -301,7 +302,6 @@ impl App {
             };
             let _ = tx.send("⧗ resolving metadata…".into());
 
-            // Poll until file list is available (up to 60 s).
             let deadline = std::time::Instant::now() + Duration::from_secs(60);
             let details = loop {
                 if std::time::Instant::now() > deadline {
@@ -335,28 +335,13 @@ impl App {
             let url = client.stream_url(id, idx);
             let title = file.name.clone();
 
-            let mut parts = player_cmd.split_whitespace();
-            let bin = parts.next().unwrap_or("mpv");
-            let extra: Vec<&str> = parts.collect();
-
-            let mut cmd = Command::new(bin);
-            cmd.args(&extra);
-            if bin == "mpv" {
-                cmd.arg(format!("--force-media-title={}", title));
-            }
-            cmd.arg(&url)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
-
-            match cmd.spawn() {
+            match spawn_player(&player_cmd, &url, &title) {
                 Ok(mut child) => {
                     let _ = tx.send(format!(
                         "▶ streaming: {}  [tmp: {}]",
                         title,
                         temp_dir.display()
                     ));
-                    // Block until MPV exits, then wipe everything.
                     child.wait().ok();
                     client.forget(id).ok();
                     let cleaned = std::fs::remove_dir_all(&temp_dir).is_ok();
@@ -367,10 +352,7 @@ impl App {
                     });
                 }
                 Err(e) => {
-                    let _ = tx.send(format!(
-                        "✗ couldn't launch '{}' ({}). Install mpv or set TORFLIX_PLAYER",
-                        bin, e
-                    ));
+                    let _ = tx.send(format!("✗ couldn't launch '{}': {}", player_cmd, e));
                     client.forget(id).ok();
                     std::fs::remove_dir_all(&temp_dir).ok();
                 }
@@ -602,6 +584,53 @@ impl App {
         };
         self.view = View::Torrents;
     }
+}
+
+/// Returns the first available media player command, or None if none found.
+/// Priority: TORFLIX_PLAYER env var → mpv → vlc.
+pub fn find_player() -> Option<String> {
+    if let Ok(p) = std::env::var("TORFLIX_PLAYER") {
+        let p = p.trim().to_string();
+        if !p.is_empty() {
+            return Some(p);
+        }
+    }
+    for candidate in &["mpv", "vlc"] {
+        if Command::new(candidate)
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok()
+        {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+/// Spawns the media player with an appropriate title flag.
+fn spawn_player(player_cmd: &str, url: &str, title: &str) -> std::io::Result<std::process::Child> {
+    let mut parts = player_cmd.split_whitespace();
+    let bin = parts.next().unwrap_or("mpv");
+    let extra: Vec<&str> = parts.collect();
+
+    let mut cmd = Command::new(bin);
+    cmd.args(&extra);
+    match bin {
+        "mpv" => {
+            cmd.arg(format!("--force-media-title={}", title));
+        }
+        "vlc" => {
+            cmd.args(["--meta-title", title]);
+        }
+        _ => {}
+    }
+    cmd.arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
 }
 
 fn snip_label(s: &str) -> String {

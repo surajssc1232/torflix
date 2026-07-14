@@ -1,129 +1,149 @@
 # torflix
 
-A terminal UI for streaming movies from torrents on Linux. Built with
-[ratatui](https://ratatui.rs), powered by the [rqbit](https://github.com/ikatson/rqbit)
-torrent engine, played through mpv.
+Stream movies in your terminal from magnet links and torrents — powered by [rqbit](https://github.com/ikatson/rqbit) + mpv/vlc.
+
+Browse popular movies from Letterboxd, search via built-in YTS (no account or setup required), paste any magnet link, and start watching in seconds. Nothing is kept on disk after playback ends.
 
 ```
  ▶ torflix  stream torrents in your terminal  engine: online
-┌ torrents ──────────────────────────────────────────────────────────┐
-│▶ Big.Buck.Bunny.2008.1080p  ████████░░░░░░░░░░░░  41.3%  3.2 MiB/s │
-│  Sintel.2010.4K             ████████████████████ 100.0%  done      │
-└─────────────────────────────────────────────────────────────────────┘
- a add  Enter files  Space pause  d remove  D remove+files  q quit
+┌ Letterboxd — Popular this week ──────────────────────────────────────┐
+│▶   1. Sinners (2025)  ★ 4.1                                          │
+│    2. Interstellar (2014)  ★ 4.5                                     │
+│    3. Parasite (2019)  ★ 4.5                                         │
+│    4. Whiplash (2014)  ★ 4.4                                         │
+└──────────────────────────────────────────────────────────────────────┘
+ IMDb: 7.8/10   RT: 89%
+ s search  Enter find torrent  Tab/→ next list  r refresh  j/k  Esc back
 ```
 
 ## How it works
 
-torflix doesn't implement BitTorrent itself. On startup it looks for a local
-rqbit engine on `127.0.0.1:3030`; if none is running it launches one
-(`rqbit server start <download-dir>`). rqbit downloads pieces and exposes every
-file over a local HTTP endpoint with Range support, so playback can start
-after a few seconds of buffering — rqbit prioritizes the pieces the player asks
-for. Pressing Enter on a file simply spawns:
-
-```
-mpv http://127.0.0.1:3030/torrents/<id>/stream/<file>
-```
-
-You can seek freely; mpv issues Range requests and rqbit fetches those pieces.
+torflix auto-starts a local [rqbit](https://github.com/ikatson/rqbit) engine on startup. rqbit downloads torrent pieces and exposes every file over a local HTTP endpoint with Range support — so mpv or vlc can start playing within a few seconds of buffering without downloading the whole file. When you quit the player, all temp files are wiped automatically.
 
 ## Requirements
 
-- `rqbit` in PATH (torrent engine)
-- `mpv` in PATH (player) — or any player, see `TORFLIX_PLAYER`
-- Rust 1.75+ to build
+| Tool | Role | Required? |
+|------|------|-----------|
+| **rqbit** | BitTorrent engine (auto-started) | Yes — [download here](https://github.com/ikatson/rqbit/releases) |
+| **mpv** | Media player | Recommended |
+| **vlc** | Media player | Alternative to mpv |
 
-On NixOS, both are in nixpkgs:
+If neither mpv nor vlc is found, the torrent is downloaded permanently to disk instead of streamed.
 
-```nix
-environment.systemPackages = with pkgs; [ rqbit mpv ];
-```
+## Installation
 
-or ad-hoc: `nix-shell -p rqbit mpv cargo`
-
-Elsewhere: `mpv` from your package manager, `rqbit` as a static binary from
-its GitHub releases page.
-
-## Build & run
-
-```sh
+```bash
+git clone <repo>
+cd torflix
 cargo build --release
-./target/release/torflix
-
-# or add something immediately:
-./target/release/torflix "magnet:?xt=urn:btih:..."
-./target/release/torflix ~/Downloads/movie.torrent
+cp target/release/torflix ~/.local/bin/
 ```
 
-## Built-in search (qBittorrent-style)
+Or run directly:
 
-Press `s`, type a query, Enter. Results from all your indexers appear sorted
-by seeders; Enter on a result adds it and starts downloading. Like
-qBittorrent's search plugins, torflix doesn't scrape torrent sites itself —
-it queries a local **Prowlarr** or **Jackett** instance, and you configure
-your indexers there once.
-
-On NixOS the whole thing is two lines:
-
-```nix
-services.prowlarr.enable = true;   # web UI on http://127.0.0.1:9696
+```bash
+cargo run --release
 ```
 
-Open the Prowlarr web UI, add your indexers, copy the API key from
-Settings → General, then:
+## Quick start
 
-```sh
-export TORFLIX_PROWLARR_URL=http://127.0.0.1:9696
-export TORFLIX_PROWLARR_APIKEY=<your key>
+```bash
+torflix
 ```
 
-Jackett works the same way (`services.jackett.enable = true;`, port 9117):
+torflix opens on the **Popular this week** list. Press `Enter` on any film to find a torrent and stream it, or press `s` to type a search query.
 
-```sh
-export TORFLIX_JACKETT_URL=http://127.0.0.1:9117
-export TORFLIX_JACKETT_APIKEY=<your key>
+You can also pass a magnet link, `.torrent` path, or torrent URL directly:
+
+```bash
+torflix "magnet:?xt=urn:btih:..."
+torflix ~/Downloads/movie.torrent
 ```
 
-If both are set, Prowlarr wins. Only plain http backends are supported
-(they're on localhost anyway).
+## Key bindings
 
-## Keys
+### Browse view (default on startup)
 
-| Key            | Action                                          |
-|----------------|-------------------------------------------------|
-| `s` or `/`     | search torrents (via Prowlarr/Jackett)          |
-| `a`            | add torrent (paste magnet link, URL, or path)   |
-| `j`/`k`, arrows| move selection                                  |
-| `Enter` / `l`  | open file list of selected torrent              |
-| `Enter` (files)| play file in mpv                                |
-| `p` (files)    | play whole torrent as an mpv playlist           |
-| `Enter` (search)| add result & start downloading                 |
-| `Space`        | pause / resume torrent                          |
-| `d`            | remove torrent, keep downloaded files           |
-| `D`            | remove torrent AND delete files                 |
-| `Esc` / `h`    | back                                            |
-| `q`            | quit (engine keeps running, downloads continue) |
-| `Q`            | quit and stop the engine torflix started        |
+| Key | Action |
+|-----|--------|
+| `j` / `k` | Move down / up |
+| `Enter` / `l` | Search for selected film and stream it |
+| `s` or `/` | Type a custom search query |
+| `Tab` / `→` | Next list: this week → this month → all-time → top rated |
+| `Shift+Tab` / `←` | Previous list |
+| `r` | Refresh current list |
+| `Esc` / `h` | Go to torrents view |
+| `q` | Quit |
 
-The file list pre-selects the largest video file — almost always the movie.
+### Torrents view
 
-## Configuration (env vars)
+| Key | Action |
+|-----|--------|
+| `a` | Add magnet link, URL, or `.torrent` path |
+| `s` or `/` | Search movies |
+| `b` | Back to browse |
+| `Enter` / `l` | Open file list |
+| `Space` | Pause / resume torrent |
+| `d` | Remove torrent (keep files on disk) |
+| `D` | Remove torrent and delete all files |
+| `q` | Quit (downloads/streams keep running) |
+| `Q` | Quit and stop the rqbit engine |
 
-| Variable               | Default                        | Meaning                       |
-|------------------------|--------------------------------|-------------------------------|
-| `TORFLIX_DOWNLOAD_DIR` | `~/Videos/torflix`             | where rqbit stores downloads  |
-| `TORFLIX_RQBIT_URL`    | `http://127.0.0.1:3030`        | engine API address            |
-| `TORFLIX_PLAYER`       | `mpv`                          | player command, e.g. `vlc` or `mpv --fullscreen` |
-| `TORFLIX_PROWLARR_URL` + `TORFLIX_PROWLARR_APIKEY` | — | enable search via Prowlarr |
-| `TORFLIX_JACKETT_URL` + `TORFLIX_JACKETT_APIKEY`   | — | enable search via Jackett  |
+### Files view
+
+| Key | Action |
+|-----|--------|
+| `Enter` / `l` | Stream selected file |
+| `p` | Play all files as a playlist |
+| `Esc` / `h` | Back |
+
+### Search results
+
+| Key | Action |
+|-----|--------|
+| `Enter` / `l` | Stream selected result |
+| `s` or `/` | New search |
+| `Esc` / `h` | Back to where you came from |
+
+## Environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TORFLIX_PLAYER` | auto | Override player (e.g. `mpv --fullscreen`) |
+| `TORFLIX_DOWNLOAD_DIR` | `~/Videos/torflix` | Download directory (used when no player found) |
+| `TORFLIX_RQBIT_URL` | `http://127.0.0.1:3030` | rqbit API URL |
+| `TORFLIX_OMDB_KEY` | — | [Free OMDb key](https://www.omdbapi.com/apikey.aspx) for IMDb + RT ratings |
+| `TORFLIX_PROWLARR_URL` | — | Prowlarr base URL for extended search |
+| `TORFLIX_PROWLARR_APIKEY` | — | Prowlarr API key |
+| `TORFLIX_JACKETT_URL` | — | Jackett base URL for extended search |
+| `TORFLIX_JACKETT_APIKEY` | — | Jackett API key |
+
+## Search backends
+
+torflix picks the first available backend automatically:
+
+1. **Prowlarr** — if `TORFLIX_PROWLARR_URL` is set (all your configured indexers)
+2. **Jackett** — if `TORFLIX_JACKETT_URL` is set
+3. **YTS** — built-in, no setup needed, movies only, includes IMDb ratings
+
+## Ratings
+
+- **Letterboxd** star ratings (★) are always shown in the browse list
+- **IMDb + Rotten Tomatoes** appear in the status bar when browsing or searching — set `TORFLIX_OMDB_KEY` to enable (free API key from [omdbapi.com](https://www.omdbapi.com/apikey.aspx))
+- **YTS IMDb ratings** appear in the `imdb` column of search results with no key needed
+
+## Streaming vs downloading
+
+When a player (mpv or vlc) is available:
+- Files go to a temp dir under `/tmp/torflix-*`
+- Playback starts after a few seconds of buffering
+- All temp files are deleted automatically when the player exits
+
+When no player is found:
+- Torrent is added to rqbit and downloads permanently to `TORFLIX_DOWNLOAD_DIR`
+- The torrent appears in the torrents list and you can track progress there
 
 ## Notes
 
-- Only download and share content you have the rights to — plenty of great
-  material is distributed legitimately over BitTorrent (Blender open movies,
-  Linux ISOs, Internet Archive, public-domain films).
-- Streaming works best on well-seeded torrents; with few peers, give it a
-  minute of buffer before playing.
-- `cargo test` includes a live integration test that runs automatically when
-  a local rqbit engine is up, and skips otherwise.
+- Only stream and share content you have the rights to — Blender open movies, Linux ISOs, Internet Archive, public-domain films, and legitimately distributed content all work great here.
+- Well-seeded torrents start instantly. Poorly-seeded ones may take a minute to buffer.
