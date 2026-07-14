@@ -62,6 +62,14 @@ fn parse_films(html: &str) -> Vec<Movie> {
         let window_end = (li_pos + 2000).min(html.len());
         let window = &html[li_pos..window_end];
 
+        // Skip adult/pornographic content (isAdultThemed is embedded in the JSON attr)
+        if window.contains("&quot;isAdultThemed&quot;:true")
+            || window.contains("\"isAdultThemed\":true")
+        {
+            pos = li_pos + anchor.len();
+            continue;
+        }
+
         let lb_rating = extract_attr(window, "data-average-rating")
             .and_then(|s| s.parse::<f32>().ok());
 

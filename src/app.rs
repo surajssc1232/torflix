@@ -403,11 +403,7 @@ impl App {
         };
         *self.search.lock().unwrap() = SearchStatus::Searching;
         self.search_selected = 0;
-        self.search_origin = if self.view == View::SearchInput {
-            View::Torrents
-        } else {
-            self.view.clone()
-        };
+        // search_origin is set by the caller (key handler or search_popular_selected)
         self.view = View::SearchResults;
         self.status = format!("searching {} for '{}' …", backend.name(), q);
         let state = Arc::clone(&self.search);
@@ -489,6 +485,7 @@ impl App {
             } else {
                 format!("{} {}", m.title, m.year)
             };
+            self.search_origin = View::Popular;
             self.search_query = query;
             self.start_search();
         }

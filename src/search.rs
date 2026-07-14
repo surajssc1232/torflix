@@ -1,6 +1,5 @@
-//! In-TUI torrent search, qBittorrent-style: torflix doesn't scrape sites
-//! itself — it queries a local Prowlarr or Jackett instance, which aggregates
-//! whichever indexers you have configured there.
+//! Torrent search: Prowlarr or Jackett if configured, otherwise falls back to
+//! the built-in YTS API (movies only, no auth required).
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -14,10 +13,10 @@ pub struct SearchResult {
     pub magnet: Option<String>,
     pub link: Option<String>,
     pub indexer: String,
+    pub rating: Option<f32>, // IMDb rating from YTS; None for Prowlarr/Jackett
 }
 
 impl SearchResult {
-    /// What we hand to rqbit: prefer the magnet, fall back to the .torrent URL.
     pub fn add_target(&self) -> Option<&str> {
         self.magnet
             .as_deref()
@@ -30,6 +29,7 @@ impl SearchResult {
 pub enum Backend {
     Prowlarr { url: String, apikey: String },
     Jackett { url: String, apikey: String },
+    Yts,
 }
 
 impl Backend {
@@ -37,12 +37,12 @@ impl Backend {
         match self {
             Backend::Prowlarr { .. } => "prowlarr",
             Backend::Jackett { .. } => "jackett",
+            Backend::Yts => "yts",
         }
     }
 }
 
-/// Reads TORFLIX_PROWLARR_URL / TORFLIX_JACKETT_URL (+ matching _APIKEY).
-/// Prowlarr wins if both are set.
+/// Returns Prowlarr or Jackett if configured, otherwise the built-in YTS backend.
 pub fn backend_from_env() -> Option<Backend> {
     let clean = |s: String| s.trim().trim_end_matches('/').to_string();
     if let Ok(url) = std::env::var("TORFLIX_PROWLARR_URL") {
@@ -61,68 +61,142 @@ pub fn backend_from_env() -> Option<Backend> {
             });
         }
     }
-    None
+    Some(Backend::Yts)
 }
 
 pub fn search(backend: &Backend, query: &str) -> Result<Vec<SearchResult>> {
-    let url = match backend {
+    match backend {
+        Backend::Yts => search_yts(query),
         Backend::Prowlarr { url, apikey } => {
             check_scheme(url)?;
-            format!(
+            let url = format!(
                 "{}/api/v1/search?query={}&apikey={}&type=search&limit=100",
                 url,
                 urlencode(query),
                 apikey
-            )
+            );
+            let body = get_body(&url, "prowlarr")?;
+            parse_prowlarr(&body)
         }
         Backend::Jackett { url, apikey } => {
             check_scheme(url)?;
-            format!(
+            let url = format!(
                 "{}/api/v2.0/indexers/all/results?apikey={}&Query={}",
                 url,
                 apikey,
                 urlencode(query)
-            )
+            );
+            let body = get_body(&url, "jackett")?;
+            parse_jackett(&body)
         }
-    };
+    }
+}
 
+// ---------- YTS built-in backend ----------
+
+#[derive(Deserialize)]
+struct YtsResponse {
+    data: YtsData,
+}
+
+#[derive(Deserialize)]
+struct YtsData {
+    #[serde(default)]
+    movies: Vec<YtsMovie>,
+}
+
+#[derive(Deserialize)]
+struct YtsMovie {
+    title: String,
+    year: u32,
+    #[serde(default)]
+    rating: f32,
+    #[serde(default)]
+    torrents: Vec<YtsTorrent>,
+}
+
+#[derive(Deserialize)]
+struct YtsTorrent {
+    hash: String,
+    quality: String,
+    #[serde(default)]
+    seeds: i64,
+    #[serde(default)]
+    peers: i64,
+    #[serde(default)]
+    size_bytes: u64,
+    #[serde(default)]
+    size: String,
+}
+
+fn search_yts(query: &str) -> Result<Vec<SearchResult>> {
+    let url = format!(
+        "https://yts.mx/api/v2/list_movies.json?query_term={}&limit=20&sort_by=seeds",
+        urlencode(query)
+    );
     let resp = minreq::get(&url)
-        .with_timeout(45)
+        .with_timeout(15)
         .send()
-        .with_context(|| format!("could not reach {}", backend.name()))?;
-    if resp.status_code == 401 || resp.status_code == 403 {
-        bail!("{} rejected the API key (HTTP {})", backend.name(), resp.status_code);
-    }
+        .context("could not reach yts.mx")?;
     if resp.status_code >= 400 {
-        bail!(
-            "{} returned HTTP {}: {}",
-            backend.name(),
-            resp.status_code,
-            snip(resp.as_str().unwrap_or(""), 140)
-        );
+        bail!("YTS returned HTTP {}", resp.status_code);
     }
+    let r: YtsResponse = resp.json().context("unexpected YTS response format")?;
 
-    let body = resp.as_str().context("non-utf8 response")?;
-    let mut results = match backend {
-        Backend::Prowlarr { .. } => parse_prowlarr(body)?,
-        Backend::Jackett { .. } => parse_jackett(body)?,
-    };
-    // Most seeders first — the ones that will actually stream.
+    let mut results = Vec::new();
+    for movie in r.data.movies {
+        let label = format!("{} ({})", movie.title, movie.year);
+        let movie_rating = if movie.rating > 0.0 { Some(movie.rating) } else { None };
+        for t in &movie.torrents {
+            let size = if t.size_bytes > 0 {
+                t.size_bytes
+            } else {
+                parse_size(&t.size)
+            };
+            results.push(SearchResult {
+                title: format!("{} [{}]", label, t.quality),
+                size,
+                seeders: t.seeds,
+                leechers: t.peers,
+                magnet: Some(build_magnet(&t.hash, &label)),
+                link: None,
+                indexer: "YTS".into(),
+                rating: movie_rating,
+            });
+        }
+    }
     results.sort_by(|a, b| b.seeders.cmp(&a.seeders));
     Ok(results)
 }
 
-fn check_scheme(url: &str) -> Result<()> {
-    if url.starts_with("https://") {
-        bail!("https backends aren't supported in this build — point torflix at the local http address (e.g. http://127.0.0.1:9696)");
-    }
-    if !url.starts_with("http://") {
-        bail!("backend URL must start with http:// (got '{}')", snip(url, 40));
-    }
-    Ok(())
+fn build_magnet(hash: &str, name: &str) -> String {
+    const TRACKERS: &[&str] = &[
+        "udp://open.demonii.com:1337/announce",
+        "udp://tracker.openbittorrent.com:80",
+        "udp://tracker.opentrackr.org:1337/announce",
+        "udp://tracker.leechers-paradise.org:6969",
+        "udp://p4p.arenabg.com:1337",
+    ];
+    let tr: String = TRACKERS.iter().map(|t| format!("&tr={}", t)).collect();
+    format!("magnet:?xt=urn:btih:{}&dn={}{}", hash, urlencode(name), tr)
 }
 
-// ---------- Prowlarr: GET /api/v1/search -> JSON array ----------
+fn parse_size(s: &str) -> u64 {
+    let s = s.trim();
+    let (num, unit) = s
+        .find(|c: char| c.is_alphabetic())
+        .map(|i| (&s[..i], s[i..].trim()))
+        .unwrap_or((s, ""));
+    let n: f64 = num.trim().parse().unwrap_or(0.0);
+    match unit.to_ascii_uppercase().as_str() {
+        "GB" | "GIB" => (n * 1_073_741_824.0) as u64,
+        "MB" | "MIB" => (n * 1_048_576.0) as u64,
+        "KB" | "KIB" => (n * 1_024.0) as u64,
+        _ => n as u64,
+    }
+}
+
+// ---------- Prowlarr ----------
 
 #[derive(Deserialize)]
 struct ProwlarrItem {
@@ -140,7 +214,6 @@ struct ProwlarrItem {
     download_url: Option<String>,
     #[serde(default)]
     indexer: String,
-    /// Prowlarr sometimes puts a magnet in `guid`.
     #[serde(default)]
     guid: Option<String>,
 }
@@ -148,7 +221,7 @@ struct ProwlarrItem {
 fn parse_prowlarr(body: &str) -> Result<Vec<SearchResult>> {
     let items: Vec<ProwlarrItem> =
         serde_json::from_str(body).context("unexpected prowlarr response format")?;
-    Ok(items
+    let mut results: Vec<SearchResult> = items
         .into_iter()
         .map(|i| {
             let magnet = i
@@ -164,12 +237,15 @@ fn parse_prowlarr(body: &str) -> Result<Vec<SearchResult>> {
                 magnet,
                 link: i.download_url,
                 indexer: i.indexer,
+                rating: None,
             }
         })
-        .collect())
+        .collect();
+    results.sort_by(|a, b| b.seeders.cmp(&a.seeders));
+    Ok(results)
 }
 
-// ---------- Jackett: GET /api/v2.0/indexers/all/results -> {"Results":[..]} ----------
+// ---------- Jackett ----------
 
 #[derive(Deserialize)]
 struct JackettResponse {
@@ -198,7 +274,7 @@ struct JackettItem {
 fn parse_jackett(body: &str) -> Result<Vec<SearchResult>> {
     let resp: JackettResponse =
         serde_json::from_str(body).context("unexpected jackett response format")?;
-    Ok(resp
+    let mut results: Vec<SearchResult> = resp
         .results
         .into_iter()
         .map(|i| SearchResult {
@@ -209,11 +285,43 @@ fn parse_jackett(body: &str) -> Result<Vec<SearchResult>> {
             magnet: i.magnet_uri.filter(|m| m.starts_with("magnet:")),
             link: i.link,
             indexer: i.tracker,
+            rating: None,
         })
-        .collect())
+        .collect();
+    results.sort_by(|a, b| b.seeders.cmp(&a.seeders));
+    Ok(results)
 }
 
-// ---------- small helpers ----------
+// ---------- helpers ----------
+
+fn get_body(url: &str, name: &str) -> Result<String> {
+    let resp = minreq::get(url)
+        .with_timeout(45)
+        .send()
+        .with_context(|| format!("could not reach {}", name))?;
+    if resp.status_code == 401 || resp.status_code == 403 {
+        bail!("{} rejected the API key (HTTP {})", name, resp.status_code);
+    }
+    if resp.status_code >= 400 {
+        bail!(
+            "{} returned HTTP {}: {}",
+            name,
+            resp.status_code,
+            snip(resp.as_str().unwrap_or(""), 140)
+        );
+    }
+    resp.as_str().context("non-utf8 response").map(|s| s.to_string())
+}
+
+fn check_scheme(url: &str) -> Result<()> {
+    if url.starts_with("https://") {
+        bail!("https backends aren't supported — point torflix at the local http address (e.g. http://127.0.0.1:9696)");
+    }
+    if !url.starts_with("http://") {
+        bail!("backend URL must start with http:// (got '{}')", snip(url, 40));
+    }
+    Ok(())
+}
 
 fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 3);
@@ -252,7 +360,6 @@ mod search_tests {
         match search(&backend, "big buck bunny") {
             Ok(results) => {
                 assert_eq!(results.len(), 3);
-                // sorted by seeders desc
                 assert_eq!(results[0].seeders, 152);
                 assert_eq!(results[0].indexer, "MockIndexerA");
                 assert!(results[0].magnet.is_none());
@@ -260,7 +367,6 @@ mod search_tests {
                 assert!(results[1].magnet.as_deref().unwrap().starts_with("magnet:"));
                 assert_eq!(crate::app::human_bytes(results[0].size), "700.0 MiB");
                 assert_eq!(crate::app::human_bytes(results[1].size), "3.0 GiB");
-                // seedless CAM result has no target at all
                 assert!(results[2].add_target().is_none());
             }
             Err(e) => {

@@ -244,7 +244,7 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
         View::SearchInput => " Enter search  Esc cancel",
         View::SearchResults => " Enter stream  s new search  j/k move  Esc back  q quit",
         View::ConfirmDelete => " y confirm  n/Esc cancel",
-        View::Popular => " Enter search  Tab/→ next list  r refresh  j/k move  Esc back  q quit",
+        View::Popular => " s search  Enter find torrent  Tab/→ next list  r refresh  j/k move  Esc back  q quit",
         View::Torrents => {
             " b browse  s search  a add  Enter files  Space pause  d remove  D remove+files  j/k  q quit"
         }
@@ -505,12 +505,18 @@ fn draw_search_results(f: &mut Frame, area: Rect, app: &App) {
                     } else {
                         Style::default().fg(RED)
                     };
+                    let rating_cell = match r.rating {
+                        Some(v) => ratatui::widgets::Cell::from(format!("{:.1}★", v))
+                            .style(Style::default().fg(YELLOW)),
+                        None => ratatui::widgets::Cell::from(""),
+                    };
                     Row::new(vec![
                         ratatui::widgets::Cell::from(r.title.clone()),
                         ratatui::widgets::Cell::from(human_bytes(r.size)),
                         ratatui::widgets::Cell::from(r.seeders.to_string()).style(seed_style),
                         ratatui::widgets::Cell::from(r.leechers.to_string())
                             .style(Style::default().fg(GRAY)),
+                        rating_cell,
                         ratatui::widgets::Cell::from(r.indexer.clone())
                             .style(Style::default().fg(GRAY)),
                     ])
@@ -521,15 +527,16 @@ fn draw_search_results(f: &mut Frame, area: Rect, app: &App) {
             let table = Table::new(
                 rows,
                 [
-                    Constraint::Min(30),
+                    Constraint::Min(28),
                     Constraint::Length(10),
                     Constraint::Length(6),
                     Constraint::Length(6),
-                    Constraint::Length(16),
+                    Constraint::Length(6),
+                    Constraint::Length(12),
                 ],
             )
             .header(
-                Row::new(vec!["title", "size", "seed", "leech", "indexer"])
+                Row::new(vec!["title", "size", "seed", "leech", "imdb", "indexer"])
                     .style(Style::default().fg(YELLOW).add_modifier(Modifier::BOLD)),
             )
             .block(block)

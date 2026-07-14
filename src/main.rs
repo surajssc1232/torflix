@@ -164,7 +164,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                         _ => {}
                     },
                     View::SearchInput => match key.code {
-                        KeyCode::Esc => app.view = View::Torrents,
+                        KeyCode::Esc => app.view = app.search_origin.clone(),
                         KeyCode::Enter => app.start_search(),
                         KeyCode::Backspace => {
                             app.search_query.pop();
@@ -179,6 +179,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                         KeyCode::Esc | KeyCode::Char('h') => app.view = app.search_origin.clone(),
                         KeyCode::Char('q') => app.should_quit = true,
                         KeyCode::Char('s') | KeyCode::Char('/') => {
+                            app.search_query.clear();
                             app.view = View::SearchInput;
                         }
                         KeyCode::Up | KeyCode::Char('k') => {
@@ -200,6 +201,11 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                                 "a: add magnet/URL  Enter: files  Space: pause  q: quit".into();
                         }
                         KeyCode::Char('q') => app.should_quit = true,
+                        KeyCode::Char('s') | KeyCode::Char('/') => {
+                            app.search_origin = View::Popular;
+                            app.search_query.clear();
+                            app.view = View::SearchInput;
+                        }
                         KeyCode::Up | KeyCode::Char('k') => {
                             app.popular_selected = app.popular_selected.saturating_sub(1);
                         }
@@ -275,6 +281,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                             app.view = View::AddInput;
                         }
                         KeyCode::Char('s') | KeyCode::Char('/') => {
+                            app.search_origin = View::Torrents;
                             app.search_query.clear();
                             app.view = View::SearchInput;
                         }
