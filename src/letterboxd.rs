@@ -15,12 +15,17 @@ pub enum ListKind {
 }
 
 impl ListKind {
-    pub fn url(&self) -> &'static str {
-        match self {
-            ListKind::Popular => "https://letterboxd.com/csi/films/films-browser-list/popular/?esiAllowFilters=true",
-            ListKind::PopularThisWeek => "https://letterboxd.com/csi/films/films-browser-list/popular/this/week/?esiAllowFilters=true",
-            ListKind::PopularThisMonth => "https://letterboxd.com/csi/films/films-browser-list/popular/this/month/?esiAllowFilters=true",
-            ListKind::TopRated => "https://letterboxd.com/csi/films/films-browser-list/by/rating/?esiAllowFilters=true",
+    pub fn url_for_page(&self, page: usize) -> String {
+        let base = match self {
+            ListKind::Popular => "https://letterboxd.com/csi/films/films-browser-list/popular",
+            ListKind::PopularThisWeek => "https://letterboxd.com/csi/films/films-browser-list/popular/this/week",
+            ListKind::PopularThisMonth => "https://letterboxd.com/csi/films/films-browser-list/popular/this/month",
+            ListKind::TopRated => "https://letterboxd.com/csi/films/films-browser-list/by/rating",
+        };
+        if page <= 1 {
+            format!("{}/?esiAllowFilters=true", base)
+        } else {
+            format!("{}/page/{}/?esiAllowFilters=true", base, page)
         }
     }
     pub fn label(&self) -> &'static str {
@@ -33,8 +38,8 @@ impl ListKind {
     }
 }
 
-pub fn fetch(kind: &ListKind) -> Result<Vec<Movie>> {
-    let resp = minreq::get(kind.url())
+pub fn fetch(kind: &ListKind, page: usize) -> Result<Vec<Movie>> {
+    let resp = minreq::get(&kind.url_for_page(page))
         .with_header(
             "User-Agent",
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \

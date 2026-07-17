@@ -244,7 +244,7 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
         View::SearchInput => " Enter search  Esc cancel",
         View::SearchResults => " Enter stream  s new search  j/k move  Esc back  q quit",
         View::ConfirmDelete => " y confirm  n/Esc cancel",
-        View::Popular => " s search  Enter find torrent  Tab/→ next list  r refresh  j/k move  Esc back  q quit",
+        View::Popular => " s search  Enter stream  Tab/→ list  ]/[ page  r refresh  j/k move  Esc back  q quit",
         View::Torrents => {
             " b browse  s search  a add  Enter files  Space pause  d remove  D remove+files  j/k  q quit"
         }
@@ -358,7 +358,11 @@ fn draw_search_popup(f: &mut Frame, area: Rect, app: &App) {
 
 fn draw_popular(f: &mut Frame, area: Rect, app: &App) {
     let label = app.popular_list.label();
-    let title = format!(" Letterboxd — {} ", label);
+    let title = if app.popular_page > 1 {
+        format!(" Letterboxd — {}  [page {}] ", label, app.popular_page)
+    } else {
+        format!(" Letterboxd — {} ", label)
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)

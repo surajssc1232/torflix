@@ -2,7 +2,7 @@
 
 Stream movies in your terminal from magnet links and torrents — powered by [rqbit](https://github.com/ikatson/rqbit) + mpv/vlc.
 
-Browse popular movies from Letterboxd, search via built-in YTS (no account or setup required), paste any magnet link, and start watching in seconds. Nothing is kept on disk after playback ends.
+Browse popular movies from Letterboxd, search via Prowlarr or Jackett, paste any magnet link, and start watching in seconds. Nothing is kept on disk after playback ends.
 
 ```
  ▶ torflix  stream torrents in your terminal  engine: online
@@ -25,6 +25,7 @@ torflix auto-starts a local [rqbit](https://github.com/ikatson/rqbit) engine on 
 | Tool | Role | Required? |
 |------|------|-----------|
 | **rqbit** | BitTorrent engine (auto-started) | Yes — [download here](https://github.com/ikatson/rqbit/releases) |
+| **Prowlarr** or **Jackett** | Torrent search | Yes for search (see setup below) |
 | **mpv** | Media player | Recommended |
 | **vlc** | Media player | Alternative to mpv |
 
@@ -60,6 +61,83 @@ torflix "magnet:?xt=urn:btih:..."
 torflix ~/Downloads/movie.torrent
 ```
 
+## Setting up search (Prowlarr — recommended)
+
+Prowlarr is a free, self-hosted app that connects to dozens of torrent indexers at once. Once running, torflix uses it automatically.
+
+### 1. Install Prowlarr
+
+Follow the official guide for your OS: https://wiki.servarr.com/prowlarr/installation
+
+On Linux the quickest way is via the install script:
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/Servarr/Wiki/master/servarr/servarr-install-script.sh)
+```
+Pick **Prowlarr** when prompted. It will run as a service on `http://127.0.0.1:9696`.
+
+### 2. Open Prowlarr and add indexers
+
+1. Go to `http://127.0.0.1:9696` in your browser
+2. Click **Indexers → Add Indexer**
+3. Search for and add the indexers you want (e.g. "1337x", "RARBG", "YTS", "EZTV")
+4. Click **Test** on each one to confirm they work
+
+### 3. Get your API key
+
+1. In Prowlarr, go to **Settings → General**
+2. Copy the value under **API Key** (looks like `a1b2c3d4e5f6...`)
+
+### 4. Set the environment variables
+
+**bash / zsh** — add to your `~/.bashrc` or `~/.zshrc`:
+```bash
+export TORFLIX_PROWLARR_URL="http://127.0.0.1:9696"
+export TORFLIX_PROWLARR_APIKEY="your_api_key_here"
+```
+Then reload: `source ~/.bashrc`
+
+**fish** — add to your `~/.config/fish/config.fish`:
+```fish
+set -gx TORFLIX_PROWLARR_URL "http://127.0.0.1:9696"
+set -gx TORFLIX_PROWLARR_APIKEY "your_api_key_here"
+```
+Then reload: `source ~/.config/fish/config.fish`
+
+### 5. Run torflix and search
+
+```bash
+torflix
+```
+Press `s`, type a movie name, hit Enter. Results come from all your configured indexers.
+
+---
+
+## Alternative: Jackett
+
+Jackett is similar to Prowlarr. Use it if you already have it set up.
+
+### Get your Jackett API key
+
+1. Open `http://127.0.0.1:9117` in your browser
+2. The **API Key** is shown at the top of the page
+3. Add indexers via **Add indexer**
+
+### Set the variables
+
+**bash / zsh:**
+```bash
+export TORFLIX_JACKETT_URL="http://127.0.0.1:9117"
+export TORFLIX_JACKETT_APIKEY="your_api_key_here"
+```
+
+**fish:**
+```fish
+set -gx TORFLIX_JACKETT_URL "http://127.0.0.1:9117"
+set -gx TORFLIX_JACKETT_APIKEY "your_api_key_here"
+```
+
+---
+
 ## Key bindings
 
 ### Browse view (default on startup)
@@ -71,7 +149,9 @@ torflix ~/Downloads/movie.torrent
 | `s` or `/` | Type a custom search query |
 | `Tab` / `→` | Next list: this week → this month → all-time → top rated |
 | `Shift+Tab` / `←` | Previous list |
-| `r` | Refresh current list |
+| `]` | Next page (72 films per page) |
+| `[` | Previous page |
+| `r` | Refresh current page |
 | `Esc` / `h` | Go to torrents view |
 | `q` | Quit |
 
@@ -109,28 +189,25 @@ torflix ~/Downloads/movie.torrent
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `TORFLIX_PROWLARR_URL` | — | Prowlarr base URL (e.g. `http://127.0.0.1:9696`) |
+| `TORFLIX_PROWLARR_APIKEY` | — | Prowlarr API key (Settings → General → API Key) |
+| `TORFLIX_JACKETT_URL` | — | Jackett base URL (e.g. `http://127.0.0.1:9117`) |
+| `TORFLIX_JACKETT_APIKEY` | — | Jackett API key (shown at top of Jackett UI) |
+| `TORFLIX_OMDB_KEY` | — | [Free OMDb key](https://www.omdbapi.com/apikey.aspx) for IMDb + RT ratings |
 | `TORFLIX_PLAYER` | auto | Override player (e.g. `mpv --fullscreen`) |
 | `TORFLIX_DOWNLOAD_DIR` | `~/Videos/torflix` | Download directory (used when no player found) |
 | `TORFLIX_RQBIT_URL` | `http://127.0.0.1:3030` | rqbit API URL |
-| `TORFLIX_OMDB_KEY` | — | [Free OMDb key](https://www.omdbapi.com/apikey.aspx) for IMDb + RT ratings |
-| `TORFLIX_PROWLARR_URL` | — | Prowlarr base URL for extended search |
-| `TORFLIX_PROWLARR_APIKEY` | — | Prowlarr API key |
-| `TORFLIX_JACKETT_URL` | — | Jackett base URL for extended search |
-| `TORFLIX_JACKETT_APIKEY` | — | Jackett API key |
-
-## Search backends
-
-torflix picks the first available backend automatically:
-
-1. **Prowlarr** — if `TORFLIX_PROWLARR_URL` is set (all your configured indexers)
-2. **Jackett** — if `TORFLIX_JACKETT_URL` is set
-3. **YTS** — built-in, no setup needed, movies only, includes IMDb ratings
 
 ## Ratings
 
 - **Letterboxd** star ratings (★) are always shown in the browse list
-- **IMDb + Rotten Tomatoes** appear in the status bar when browsing or searching — set `TORFLIX_OMDB_KEY` to enable (free API key from [omdbapi.com](https://www.omdbapi.com/apikey.aspx))
-- **YTS IMDb ratings** appear in the `imdb` column of search results with no key needed
+- **IMDb + Rotten Tomatoes** appear in the status bar when browsing or searching — set `TORFLIX_OMDB_KEY` to enable
+
+To get a free OMDb API key:
+1. Go to https://www.omdbapi.com/apikey.aspx
+2. Choose the **Free** tier and enter your email
+3. Check your email for the key and activate it
+4. Set `TORFLIX_OMDB_KEY=your_key_here` in your shell config
 
 ## Streaming vs downloading
 

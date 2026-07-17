@@ -81,6 +81,7 @@ pub struct App {
     pub popular: Arc<Mutex<PopularStatus>>,
     pub popular_selected: usize,
     pub popular_list: ListKind,
+    pub popular_page: usize,
 
     // Ratings cache (IMDb + RT via OMDb, keyed by "title|year")
     pub ratings: Arc<Mutex<HashMap<String, omdb::Ratings>>>,
@@ -117,6 +118,7 @@ impl App {
             popular: Arc::new(Mutex::new(PopularStatus::Idle)),
             popular_selected: 0,
             popular_list: ListKind::Popular,
+            popular_page: 1,
             ratings: Arc::new(Mutex::new(HashMap::new())),
             ratings_fetching: Arc::new(Mutex::new(None)),
             status_tx,
@@ -424,22 +426,51 @@ impl App {
 
     pub fn browse_popular(&mut self, kind: ListKind) {
         self.popular_list = kind;
+        self.popular_page = 1;
         self.popular_selected = 0;
         self.view = View::Popular;
+        self.load_popular_page();
+    }
+
+    pub fn popular_next_page(&mut self) {
+        self.popular_page += 1;
+        self.popular_selected = 0;
+        self.load_popular_page();
+    }
+
+    pub fn popular_prev_page(&mut self) {
+        if self.popular_page > 1 {
+            self.popular_page -= 1;
+            self.popular_selected = 0;
+            self.load_popular_page();
+        }
+    }
+
+    pub fn popular_refresh(&mut self) {
+        self.popular_selected = 0;
+        self.load_popular_page();
+    }
+
+    fn load_popular_page(&mut self) {
+        let page = self.popular_page;
         *self.popular.lock().unwrap() = PopularStatus::Loading;
-        self.status = format!("loading {} from Letterboxd…", self.popular_list.label());
+        self.status = if page > 1 {
+            format!("loading {} page {} from Letterboxd…", self.popular_list.label(), page)
+        } else {
+            format!("loading {} from Letterboxd…", self.popular_list.label())
+        };
 
         let state = Arc::clone(&self.popular);
-        let url_kind = match &self.popular_list {
+        let kind = match &self.popular_list {
             ListKind::Popular => ListKind::Popular,
             ListKind::PopularThisWeek => ListKind::PopularThisWeek,
             ListKind::PopularThisMonth => ListKind::PopularThisMonth,
             ListKind::TopRated => ListKind::TopRated,
         };
         thread::spawn(move || {
-            let out = match letterboxd::fetch(&url_kind) {
+            let out = match letterboxd::fetch(&kind, page) {
                 Ok(v) if v.is_empty() => PopularStatus::Failed(
-                    "no films parsed — Letterboxd may have changed its HTML".into(),
+                    "no films found on this page".into(),
                 ),
                 Ok(v) => PopularStatus::Done(v),
                 Err(e) => PopularStatus::Failed(e.to_string()),

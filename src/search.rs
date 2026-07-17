@@ -1,5 +1,4 @@
-//! Torrent search: Prowlarr or Jackett if configured, otherwise falls back to
-//! the built-in YTS API (movies only, no auth required).
+//! Torrent search via Prowlarr or Jackett.
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -13,7 +12,7 @@ pub struct SearchResult {
     pub magnet: Option<String>,
     pub link: Option<String>,
     pub indexer: String,
-    pub rating: Option<f32>, // IMDb rating from YTS; None for Prowlarr/Jackett
+    pub rating: Option<f32>,
 }
 
 impl SearchResult {
@@ -29,7 +28,6 @@ impl SearchResult {
 pub enum Backend {
     Prowlarr { url: String, apikey: String },
     Jackett { url: String, apikey: String },
-    Yts,
 }
 
 impl Backend {
@@ -37,12 +35,11 @@ impl Backend {
         match self {
             Backend::Prowlarr { .. } => "prowlarr",
             Backend::Jackett { .. } => "jackett",
-            Backend::Yts => "yts",
         }
     }
 }
 
-/// Returns Prowlarr or Jackett if configured, otherwise the built-in YTS backend.
+/// Returns the configured backend, or None if neither Prowlarr nor Jackett is set.
 pub fn backend_from_env() -> Option<Backend> {
     let clean = |s: String| s.trim().trim_end_matches('/').to_string();
     if let Ok(url) = std::env::var("TORFLIX_PROWLARR_URL") {
@@ -61,12 +58,11 @@ pub fn backend_from_env() -> Option<Backend> {
             });
         }
     }
-    Some(Backend::Yts)
+    None
 }
 
 pub fn search(backend: &Backend, query: &str) -> Result<Vec<SearchResult>> {
     match backend {
-        Backend::Yts => search_yts(query),
         Backend::Prowlarr { url, apikey } => {
             check_scheme(url)?;
             let url = format!(
@@ -89,110 +85,6 @@ pub fn search(backend: &Backend, query: &str) -> Result<Vec<SearchResult>> {
             let body = get_body(&url, "jackett")?;
             parse_jackett(&body)
         }
-    }
-}
-
-// ---------- YTS built-in backend ----------
-
-#[derive(Deserialize)]
-struct YtsResponse {
-    data: YtsData,
-}
-
-#[derive(Deserialize)]
-struct YtsData {
-    #[serde(default)]
-    movies: Vec<YtsMovie>,
-}
-
-#[derive(Deserialize)]
-struct YtsMovie {
-    title: String,
-    year: u32,
-    #[serde(default)]
-    rating: f32,
-    #[serde(default)]
-    torrents: Vec<YtsTorrent>,
-}
-
-#[derive(Deserialize)]
-struct YtsTorrent {
-    hash: String,
-    quality: String,
-    #[serde(default)]
-    seeds: i64,
-    #[serde(default)]
-    peers: i64,
-    #[serde(default)]
-    size_bytes: u64,
-    #[serde(default)]
-    size: String,
-}
-
-fn search_yts(query: &str) -> Result<Vec<SearchResult>> {
-    let url = format!(
-        "https://yts.mx/api/v2/list_movies.json?query_term={}&limit=20&sort_by=seeds",
-        urlencode(query)
-    );
-    let resp = minreq::get(&url)
-        .with_timeout(15)
-        .send()
-        .context("could not reach yts.mx")?;
-    if resp.status_code >= 400 {
-        bail!("YTS returned HTTP {}", resp.status_code);
-    }
-    let r: YtsResponse = resp.json().context("unexpected YTS response format")?;
-
-    let mut results = Vec::new();
-    for movie in r.data.movies {
-        let label = format!("{} ({})", movie.title, movie.year);
-        let movie_rating = if movie.rating > 0.0 { Some(movie.rating) } else { None };
-        for t in &movie.torrents {
-            let size = if t.size_bytes > 0 {
-                t.size_bytes
-            } else {
-                parse_size(&t.size)
-            };
-            results.push(SearchResult {
-                title: format!("{} [{}]", label, t.quality),
-                size,
-                seeders: t.seeds,
-                leechers: t.peers,
-                magnet: Some(build_magnet(&t.hash, &label)),
-                link: None,
-                indexer: "YTS".into(),
-                rating: movie_rating,
-            });
-        }
-    }
-    results.sort_by(|a, b| b.seeders.cmp(&a.seeders));
-    Ok(results)
-}
-
-fn build_magnet(hash: &str, name: &str) -> String {
-    const TRACKERS: &[&str] = &[
-        "udp://open.demonii.com:1337/announce",
-        "udp://tracker.openbittorrent.com:80",
-        "udp://tracker.opentrackr.org:1337/announce",
-        "udp://tracker.leechers-paradise.org:6969",
-        "udp://p4p.arenabg.com:1337",
-    ];
-    let tr: String = TRACKERS.iter().map(|t| format!("&tr={}", t)).collect();
-    format!("magnet:?xt=urn:btih:{}&dn={}{}", hash, urlencode(name), tr)
-}
-
-fn parse_size(s: &str) -> u64 {
-    let s = s.trim();
-    let (num, unit) = s
-        .find(|c: char| c.is_alphabetic())
-        .map(|i| (&s[..i], s[i..].trim()))
-        .unwrap_or((s, ""));
-    let n: f64 = num.trim().parse().unwrap_or(0.0);
-    match unit.to_ascii_uppercase().as_str() {
-        "GB" | "GIB" => (n * 1_073_741_824.0) as u64,
-        "MB" | "MIB" => (n * 1_048_576.0) as u64,
-        "KB" | "KIB" => (n * 1_024.0) as u64,
-        _ => n as u64,
     }
 }
 
@@ -345,7 +237,6 @@ fn snip(s: &str, n: usize) -> String {
         format!("{}…", s.chars().take(n).collect::<String>())
     }
 }
-
 
 #[cfg(test)]
 mod search_tests {

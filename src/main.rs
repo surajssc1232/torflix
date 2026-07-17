@@ -235,15 +235,9 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                             };
                             app.browse_popular(prev);
                         }
-                        KeyCode::Char('r') => {
-                            let kind = match app.popular_list {
-                                ListKind::Popular => ListKind::Popular,
-                                ListKind::PopularThisWeek => ListKind::PopularThisWeek,
-                                ListKind::PopularThisMonth => ListKind::PopularThisMonth,
-                                ListKind::TopRated => ListKind::TopRated,
-                            };
-                            app.browse_popular(kind);
-                        }
+                        KeyCode::Char('r') => app.popular_refresh(),
+                        KeyCode::Char(']') => app.popular_next_page(),
+                        KeyCode::Char('[') => app.popular_prev_page(),
                         _ => {}
                     },
                     View::ConfirmDelete => match key.code {
