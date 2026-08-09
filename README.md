@@ -20,13 +20,12 @@ Browse popular movies from Letterboxd, search torrents out of the box (no Prowla
 
 ## How it works
 
-torflix auto-starts a local [rqbit](https://github.com/ikatson/rqbit) engine on startup. rqbit downloads torrent pieces and exposes every file over a local HTTP endpoint with Range support — so mpv or vlc can start playing within a few seconds of buffering without downloading the whole file. When you quit the player, all temp files are wiped automatically.
+torflix embeds [rqbit](https://github.com/ikatson/rqbit) directly — no separate install needed. On startup it spins up a local BitTorrent engine that downloads torrent pieces and exposes every file over a local HTTP endpoint with Range support, so mpv or vlc can start playing within a few seconds of buffering without downloading the whole file. When you quit the player, all temp files are wiped automatically.
 
 ## Requirements
 
 | Tool | Role | Required? |
 |------|------|-----------|
-| **rqbit** | BitTorrent engine (auto-started) | Yes — [download here](https://github.com/ikatson/rqbit/releases) |
 | **mpv** | Media player | Recommended |
 | **vlc** | Media player | Alternative to mpv |
 | **Prowlarr** or **Jackett** | More torrent sources | Optional — built-in search works without them |

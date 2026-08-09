@@ -47,12 +47,11 @@ fn main() -> Result<()> {
         std::env::var("TORFLIX_RQBIT_URL").unwrap_or_else(|_| rqbit::DEFAULT_API.to_string());
     let client = Client::new(&api_url);
 
-    // Start a local rqbit engine if none is running.
-    let mut engine_child = None;
+    // Start the embedded rqbit engine if no external one is running.
+    let mut embedded_engine = None;
     if !client.is_up() {
-        eprintln!("starting rqbit engine (downloads -> {}) ...", download_dir().display());
-        let child = rqbit::spawn_engine(&download_dir())?;
-        engine_child = Some(child);
+        let engine = rqbit::start_embedded_engine(&download_dir())?;
+        embedded_engine = Some(engine);
         let mut ok = false;
         for _ in 0..40 {
             std::thread::sleep(Duration::from_millis(250));
@@ -62,8 +61,8 @@ fn main() -> Result<()> {
             }
         }
         if !ok {
-            if let Some(mut c) = engine_child {
-                let _ = c.kill();
+            if let Some(mut e) = embedded_engine {
+                e.stop();
             }
             anyhow::bail!("rqbit engine did not come up on {}", api_url);
         }
@@ -105,18 +104,8 @@ fn main() -> Result<()> {
     execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableBracketedPaste)?;
     terminal.show_cursor()?;
 
-    if app.stop_engine_on_quit {
-        if let Some(mut c) = engine_child {
-            let _ = c.kill();
-            let _ = c.wait();
-            println!("rqbit engine stopped.");
-        } else {
-            println!("note: the rqbit engine was already running before torflix; leaving it alone.");
-        }
-    } else if engine_child.is_some() {
-        println!(
-            "rqbit engine left running so downloads/streams continue (quit with Q to stop it)."
-        );
+    if let Some(mut e) = embedded_engine {
+        e.stop();
     }
 
     res

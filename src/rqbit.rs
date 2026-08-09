@@ -4,7 +4,6 @@
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
 
 pub const DEFAULT_API: &str = "http://127.0.0.1:3030";
 
@@ -274,21 +273,64 @@ fn snip(s: &str, n: usize) -> String {
     }
 }
 
-/// Launch a local rqbit engine if one isn't already running.
-pub fn spawn_engine(download_dir: &Path) -> Result<Child> {
+/// Handle to the embedded rqbit engine running in a background thread.
+pub struct EmbeddedEngine {
+    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl EmbeddedEngine {
+    pub fn stop(&mut self) {
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// Start the rqbit HTTP API server embedded in-process on 127.0.0.1:3030.
+pub fn start_embedded_engine(download_dir: &Path) -> Result<EmbeddedEngine> {
     std::fs::create_dir_all(download_dir).ok();
-    Command::new("rqbit")
-        .arg("server")
-        .arg("start")
-        .arg(download_dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context(
-            "could not launch `rqbit`. Install it (e.g. `nix-shell -p rqbit`, or grab the \
-             static binary from github.com/ikatson/rqbit/releases) and make sure it's in PATH",
-        )
+    let download_dir = download_dir.to_path_buf();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let thread = std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async move {
+            use librqbit::http_api::{HttpApi, HttpApiOptions};
+            use librqbit::{Api, Session, SessionOptions};
+
+            let session = match Session::new_with_opts(download_dir, SessionOptions::default()).await {
+                Ok(s) => s,
+                Err(e) => { eprintln!("rqbit session error: {e}"); return; }
+            };
+
+            let api = Api::new(session, None, None);
+            let http = HttpApi::new(api, Some(HttpApiOptions {
+                read_only: false,
+                allow_create: true,
+                ..Default::default()
+            }));
+
+            let addr: std::net::SocketAddr = "127.0.0.1:3030".parse().unwrap();
+            let listener = match librqbit_dualstack_sockets::TcpListener::bind_tcp(addr, Default::default()) {
+                Ok(l) => l,
+                Err(e) => { eprintln!("rqbit bind error: {e}"); return; }
+            };
+
+            tokio::select! {
+                _ = http.make_http_api_and_run(listener, None) => {}
+                _ = shutdown_rx => {}
+            }
+        });
+    });
+
+    Ok(EmbeddedEngine {
+        shutdown_tx: Some(shutdown_tx),
+        thread: Some(thread),
+    })
 }
 
 #[cfg(test)]
