@@ -101,26 +101,34 @@ pub fn search(backend: &Backend, query: &str) -> Result<Vec<SearchResult>> {
 // ============================================================================
 
 fn search_builtin(query: &str) -> Result<Vec<SearchResult>> {
+    let mut all: Vec<SearchResult> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
 
-    // apibay is tried first — its JSON endpoint is reachable from most
-    // networks that block full torrent sites (Cloudflare-fronted).
     match search_apibay(query) {
-        Ok(r) if !r.is_empty() => return Ok(r),
-        Ok(_) => errors.push("apibay: no results".into()),
+        Ok(r) => all.extend(r),
         Err(e) => errors.push(format!("apibay: {}", e)),
     }
-    // TorrentGalaxy as fallback for users on unrestricted networks.
     match search_torrentgalaxy(query) {
-        Ok(r) if !r.is_empty() => return Ok(r),
-        Ok(_) => errors.push("TorrentGalaxy: no results".into()),
+        Ok(r) => all.extend(r),
         Err(e) => errors.push(format!("TorrentGalaxy: {}", e)),
     }
+    match search_1337x(query) {
+        Ok(r) => all.extend(r),
+        Err(e) => errors.push(format!("1337x: {}", e)),
+    }
 
-    bail!(
-        "no results — sources tried: {}\n\nIf results are empty, your ISP may be blocking torrent sites.\n→ Enable a VPN and try again, or set up Prowlarr for more sources (see README).",
-        errors.join(" | ")
-    )
+    if all.is_empty() {
+        bail!(
+            "no results — sources tried: {}\n\nIf results are empty, your ISP may be blocking torrent sites.\n→ Enable a VPN and try again, or set up Prowlarr for more sources (see README).",
+            errors.join(" | ")
+        );
+    }
+
+    // Deduplicate by title (case-insensitive), keep highest-seeder entry.
+    all.sort_by(|a, b| b.seeders.cmp(&a.seeders));
+    let mut seen = std::collections::HashSet::new();
+    all.retain(|r| seen.insert(r.title.to_ascii_lowercase()));
+    Ok(all)
 }
 
 // ---- TorrentGalaxy (HTML scrape, magnets inline in search results) ----
@@ -195,6 +203,91 @@ fn parse_torrentgalaxy(html: &str) -> Vec<SearchResult> {
     results
 }
 
+// ---- 1337x (HTML scrape) ----
+
+fn search_1337x(query: &str) -> Result<Vec<SearchResult>> {
+    let url = format!("https://1337x.to/search/{}/1/", urlencode(query));
+    let resp = minreq::get(&url)
+        .with_header("User-Agent", UA)
+        .with_header("Accept", "text/html,application/xhtml+xml")
+        .with_timeout(10)
+        .send()
+        .context("1337x unreachable")?;
+    if resp.status_code >= 400 {
+        bail!("HTTP {}", resp.status_code);
+    }
+    let html = resp.as_str().context("non-utf8 response")?;
+    let mut results = parse_1337x_listing(html);
+
+    // Fetch magnet links from detail pages for the top 15 results.
+    results.truncate(15);
+    for r in &mut results {
+        if let Some(detail_url) = r.link.as_deref() {
+            if let Ok(magnet) = fetch_1337x_magnet(detail_url) {
+                r.magnet = Some(magnet);
+            }
+        }
+    }
+    results.retain(|r| r.magnet.is_some());
+    Ok(results)
+}
+
+fn fetch_1337x_magnet(detail_url: &str) -> Result<String> {
+    let resp = minreq::get(detail_url)
+        .with_header("User-Agent", UA)
+        .with_timeout(8)
+        .send()
+        .context("1337x detail unreachable")?;
+    let html = resp.as_str().context("non-utf8")?;
+    extract_between(html, "href=\"magnet:", "\"")
+        .map(|m| format!("magnet:{}", m))
+        .ok_or_else(|| anyhow::anyhow!("no magnet on detail page"))
+}
+
+fn parse_1337x_listing(html: &str) -> Vec<SearchResult> {
+    let mut results = Vec::new();
+    for chunk in html.split("/torrent/").skip(1) {
+        let id = match chunk.find('/') {
+            Some(i) => &chunk[..i],
+            None => continue,
+        };
+        if id.is_empty() || !id.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+
+        let title = match extract_between(chunk, "\">", "</a>") {
+            Some(t) if !t.is_empty() && !t.starts_with('<') => t.replace("&amp;", "&"),
+            _ => continue,
+        };
+
+        let seeders = extract_between(chunk, "seeds\">", "<")
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(0);
+        let leechers = extract_between(chunk, "leeches\">", "<")
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(0);
+        let size_str = extract_between(chunk, "coll-4 size mob-uploader\">", "<")
+            .unwrap_or_default();
+        let size = parse_size(size_str.split('<').next().unwrap_or("").trim());
+
+        // Build a stable detail URL using only the numeric ID.
+        let detail_url = format!("https://1337x.to/torrent/{}/{}/", id, urlencode(&title));
+
+        results.push(SearchResult {
+            title,
+            size,
+            seeders,
+            leechers,
+            magnet: None,
+            link: Some(detail_url),
+            indexer: "1337x".into(),
+            rating: None,
+        });
+    }
+    results.sort_by(|a, b| b.seeders.cmp(&a.seeders));
+    results
+}
+
 // ---- apibay.org fallback (Pirate Bay JSON API) ----
 
 #[derive(Deserialize)]
@@ -212,7 +305,7 @@ struct ApibayItem {
 }
 
 fn search_apibay(query: &str) -> Result<Vec<SearchResult>> {
-    let url = format!("https://apibay.org/q.php?q={}&cat=200", urlencode(query));
+    let url = format!("https://apibay.org/q.php?q={}&cat=0", urlencode(query));
     // Try up to 3 times: 0s, 2s, 4s. Retries on 429 or TLS errors.
     for delay_ms in [0u64, 2000, 4000] {
         if delay_ms > 0 {
