@@ -146,6 +146,14 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                 _ => {}
             },
             Event::Key(key) if key.kind == KeyEventKind::Press => {
+                if key.code == KeyCode::Char('?') {
+                    app.show_help = !app.show_help;
+                    continue;
+                }
+                if app.show_help {
+                    app.show_help = false;
+                    continue;
+                }
                 let n_rows = app.rows_snapshot().len();
                 match app.view {
                     View::AddInput => match key.code {
@@ -192,6 +200,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                             }
                         }
                         KeyCode::Enter | KeyCode::Char('l') => app.add_search_selected(),
+                        KeyCode::Char('d') => app.download_search_selected(),
                         KeyCode::Char('o') => {
                             app.search_sort = app.search_sort.next();
                             app.search_selected = 0;

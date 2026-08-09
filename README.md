@@ -193,7 +193,8 @@ set -gx TORFLIX_JACKETT_APIKEY "your_api_key_here"
 
 | Key | Action |
 |-----|--------|
-| `Enter` / `l` | Stream selected result |
+| `Enter` / `l` | Stream selected result (temp dir, deleted after playback) |
+| `d` | Download selected result permanently to `~/Downloads/torflix` |
 | `o` | Cycle sort: seeders → name → size (name-sort groups S01E01/E02/E03 together) |
 | `s` or `/` | New search |
 | `Esc` / `h` | Back to where you came from |

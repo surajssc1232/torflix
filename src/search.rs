@@ -118,7 +118,7 @@ fn search_builtin(query: &str) -> Result<Vec<SearchResult>> {
     }
 
     bail!(
-        "no results.\nTried: {}\nIf every source failed, your network may be blocking torrent sites — try a VPN or set up Prowlarr (see README).",
+        "no results — sources tried: {}\n\nIf results are empty, your ISP may be blocking torrent sites.\n→ Enable a VPN and try again, or set up Prowlarr for more sources (see README).",
         errors.join(" | ")
     )
 }

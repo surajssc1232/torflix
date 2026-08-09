@@ -9,6 +9,28 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+pub fn download_dir() -> std::path::PathBuf {
+    if let Ok(dir) = std::env::var("TORFLIX_DOWNLOAD_DIR") {
+        return std::path::PathBuf::from(dir);
+    }
+    dirs::download_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("torflix")
+}
+
+fn help_seen() -> bool {
+    let path = dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("torflix")
+        .join("help_seen");
+    if path.exists() {
+        return true;
+    }
+    std::fs::create_dir_all(path.parent().unwrap()).ok();
+    std::fs::write(&path, b"").ok();
+    false
+}
+
 pub const VIDEO_EXTS: &[&str] = &[
     "mkv", "mp4", "avi", "webm", "mov", "m4v", "ts", "flv", "wmv", "mpg", "mpeg",
 ];
@@ -119,6 +141,7 @@ pub struct App {
     pub status: String,
     pub should_quit: bool,
     pub stop_engine_on_quit: bool,
+    pub show_help: bool,
 }
 
 impl App {
@@ -152,6 +175,7 @@ impl App {
             status: String::from("a: add magnet/URL  Enter: files  Space: pause  q: quit"),
             should_quit: false,
             stop_engine_on_quit: false,
+            show_help: !help_seen(),
         }
     }
 
@@ -439,6 +463,44 @@ impl App {
             SortMode::Size => refs.sort_by(|a, b| b.size.cmp(&a.size)),
         }
         refs
+    }
+
+    pub fn download_search_selected(&mut self) {
+        let picked: Option<SearchResult> = match &*self.search.lock().unwrap() {
+            SearchStatus::Done(v) => {
+                let sorted = self.sort_results(v);
+                sorted.get(self.search_selected).map(|r| (*r).clone())
+            }
+            _ => None,
+        };
+        let Some(r) = picked else { return };
+        match r.add_target() {
+            Some(target) => {
+                let target = target.to_string();
+                self.download_to_disk_async(&target, &r.title);
+            }
+            None => self.status = "✗ result has no magnet or download link".into(),
+        }
+    }
+
+    fn download_to_disk_async(&mut self, target: &str, label: &str) {
+        let client = self.client.clone();
+        let tx = self.status_tx.clone();
+        let target = target.to_string();
+        let label = label.to_string();
+        let dest = download_dir();
+        self.status = format!("⬇ queuing: {} → {}", label, dest.display());
+        thread::spawn(move || {
+            std::fs::create_dir_all(&dest).ok();
+            match client.add_to_dir(&target, &dest) {
+                Ok(_) => {
+                    let _ = tx.send(format!("⬇ downloading: {}  →  {}", label, dest.display()));
+                }
+                Err(e) => {
+                    let _ = tx.send(format!("✗ download failed: {}", e));
+                }
+            }
+        });
     }
 
     pub fn add_search_selected(&mut self) {

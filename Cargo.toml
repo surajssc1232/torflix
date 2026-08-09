@@ -2,8 +2,13 @@
 name = "torflix"
 version = "0.1.0"
 edition = "2021"
-description = "A terminal UI for streaming movies from torrents, powered by rqbit + mpv"
+description = "Stream movies in your terminal from magnet links and torrents — powered by rqbit + mpv/vlc"
 license = "MIT"
+repository = "https://github.com/surajssc1232/torflix"
+homepage = "https://github.com/surajssc1232/torflix"
+readme = "README.md"
+keywords = ["torrent", "streaming", "tui", "mpv", "rqbit"]
+categories = ["command-line-utilities", "multimedia"]
 
 [dependencies]
 ratatui = "0.26"

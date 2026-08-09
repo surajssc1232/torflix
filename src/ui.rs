@@ -52,6 +52,9 @@ pub fn draw(f: &mut Frame, app: &App) {
     if app.view == View::ConfirmDelete {
         draw_confirm_popup(f, area, app);
     }
+    if app.show_help {
+        draw_help_popup(f, area);
+    }
 }
 
 fn draw_title(f: &mut Frame, area: Rect, app: &App) {
@@ -239,20 +242,90 @@ fn status_style(status: &str) -> (String, Style) {
 
 fn draw_help(f: &mut Frame, area: Rect, app: &App) {
     let help = match app.view {
-        View::Files => " Enter play  p playlist  j/k move  Esc back  q quit",
+        View::Files => " Enter play  p playlist  j/k move  Esc back  q quit  ? help",
         View::AddInput => " Enter add  Esc cancel  (paste magnet / URL / .torrent path)",
         View::SearchInput => " Enter search  Esc cancel",
-        View::SearchResults => " Enter stream  o sort (seed/name/size)  s search  j/k move  Esc back  q quit",
+        View::SearchResults => " Enter stream  d download  o sort  s search  j/k  Esc back  ? help",
         View::ConfirmDelete => " y confirm  n/Esc cancel",
-        View::Popular => " s search  Enter stream  Tab/→ list  ]/[ page  r refresh  j/k move  Esc back  q quit",
+        View::Popular => " s search  Enter stream  Tab/→ list  ]/[ page  r refresh  j/k  ? help",
         View::Torrents => {
-            " b browse  s search  a add  Enter files  Space pause  d remove  D remove+files  j/k  q quit"
+            " b browse  s search  a add  Enter files  Space pause  d remove  j/k  q quit  ? help"
         }
     };
     f.render_widget(
         Paragraph::new(Span::styled(help, Style::default().fg(GRAY).bg(Color::Rgb(0x1d, 0x20, 0x21)))),
         area,
     );
+}
+
+fn draw_help_popup(f: &mut Frame, area: Rect) {
+    let popup = centered_rect(70, 24, area);
+    f.render_widget(Clear, popup);
+
+    fn key(k: &'static str) -> Span<'static> {
+        Span::styled(
+            format!("{:<12}", k),
+            Style::default().fg(YELLOW).add_modifier(Modifier::BOLD),
+        )
+    }
+    fn desc(d: &'static str) -> Span<'static> {
+        Span::styled(d, Style::default().fg(FG))
+    }
+    fn section(s: &'static str) -> Line<'static> {
+        Line::from(Span::styled(
+            format!("  {}", s),
+            Style::default().fg(AQUA).add_modifier(Modifier::BOLD),
+        ))
+    }
+    fn row(k: &'static str, d: &'static str) -> Line<'static> {
+        Line::from(vec![
+            Span::raw("    "),
+            key(k),
+            desc(d),
+        ])
+    }
+
+    let lines: Vec<Line> = vec![
+        Line::from(""),
+        section("Browse (Letterboxd)"),
+        row("j / k",       "move down / up"),
+        row("Enter",       "search & stream selected film"),
+        row("s  or  /",    "type a search query"),
+        row("Tab / →",     "cycle lists: week / month / all-time / top"),
+        row("] / [",       "next / previous page"),
+        row("r",           "refresh current page"),
+        Line::from(""),
+        section("Search Results"),
+        row("Enter",       "stream selected result"),
+        row("d",           "download permanently to ~/Downloads/torflix"),
+        row("o",           "cycle sort: seeders → name → size"),
+        row("s  or  /",    "new search"),
+        Line::from(""),
+        section("Files view"),
+        row("Enter",       "stream selected file"),
+        row("p",           "play all files as playlist"),
+        Line::from(""),
+        section("Torrents view"),
+        row("a",           "add magnet link / URL / .torrent path"),
+        row("Space",       "pause / resume torrent"),
+        row("d / D",       "remove (keep files) / remove + delete files"),
+        row("b",           "go to browse (Letterboxd)"),
+        row("q / Q",       "quit / quit and stop engine"),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  press ? to open this again  ·  any key to close",
+            Style::default().fg(GRAY),
+        )),
+    ];
+
+    let p = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" keyboard shortcuts ")
+            .border_style(Style::default().fg(YELLOW))
+            .style(Style::default().bg(BG)),
+    );
+    f.render_widget(p, popup);
 }
 
 fn centered_rect(width: u16, height: u16, r: Rect) -> Rect {
