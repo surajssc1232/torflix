@@ -104,18 +104,25 @@ fn search_builtin(query: &str) -> Result<Vec<SearchResult>> {
     let mut all: Vec<SearchResult> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
 
-    match search_apibay(query) {
-        Ok(r) => all.extend(r),
-        Err(e) => errors.push(format!("apibay: {}", e)),
+    macro_rules! src {
+        ($name:expr, $call:expr) => {
+            match $call {
+                Ok(r) => all.extend(r),
+                Err(e) => errors.push(format!("{}: {}", $name, e)),
+            }
+        };
     }
-    match search_torrentgalaxy(query) {
-        Ok(r) => all.extend(r),
-        Err(e) => errors.push(format!("TorrentGalaxy: {}", e)),
-    }
-    match search_1337x(query) {
-        Ok(r) => all.extend(r),
-        Err(e) => errors.push(format!("1337x: {}", e)),
-    }
+
+    src!("Knaben",       search_knaben(query));
+    src!("apibay",       search_apibay(query));
+    src!("Bitsearch",    search_bitsearch(query));
+    src!("TorrentsCSV",  search_torrents_csv(query));
+    src!("YTS",          search_yts(query));
+    src!("Nyaa",         search_nyaa(query));
+    src!("Solidtorrents",search_solidtorrents(query));
+    src!("TorrentGalaxy",search_torrentgalaxy(query));
+    src!("BT4G",         search_bt4g(query));
+    src!("1337x",        search_1337x(query));
 
     if all.is_empty() {
         bail!(
@@ -124,7 +131,6 @@ fn search_builtin(query: &str) -> Result<Vec<SearchResult>> {
         );
     }
 
-    // Deduplicate by title (case-insensitive), keep highest-seeder entry.
     all.sort_by(|a, b| b.seeders.cmp(&a.seeders));
     let mut seen = std::collections::HashSet::new();
     all.retain(|r| seen.insert(r.title.to_ascii_lowercase()));
@@ -343,6 +349,287 @@ fn search_apibay(query: &str) -> Result<Vec<SearchResult>> {
         return Ok(results);
     }
     bail!("rate-limited after 3 attempts")
+}
+
+// ---- Knaben (JSON POST meta-search — covers 50+ trackers) ----
+
+fn search_knaben(query: &str) -> Result<Vec<SearchResult>> {
+    #[derive(Deserialize)]
+    struct Hit {
+        #[serde(default)] title: String,
+        #[serde(default)] hash: String,
+        #[serde(default)] seeders: i64,
+        #[serde(default)] peers: i64,
+        #[serde(default)] bytes: u64,
+        #[serde(default, rename = "magnetUrl")] magnet_url: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct Resp { #[serde(default)] hits: Vec<Hit> }
+
+    let body = format!(
+        r#"{{"query":{},"order_by":"seeders","order_direction":"desc","size":50,"hide_xxx":true}}"#,
+        serde_json::to_string(query)?
+    );
+    let resp = minreq::post("https://api.knaben.org/v1")
+        .with_header("Content-Type", "application/json")
+        .with_header("User-Agent", UA)
+        .with_body(body)
+        .with_timeout(12)
+        .send()
+        .context("knaben unreachable")?;
+    if resp.status_code >= 400 { bail!("HTTP {}", resp.status_code); }
+    let r: Resp = resp.json().context("bad JSON")?;
+    Ok(r.hits.into_iter()
+        .filter(|h| !h.title.is_empty() && !h.hash.is_empty())
+        .map(|h| {
+            let magnet = h.magnet_url
+                .filter(|m| m.starts_with("magnet:"))
+                .unwrap_or_else(|| build_magnet(&h.hash, &h.title));
+            SearchResult { title: h.title, size: h.bytes, seeders: h.seeders,
+                leechers: h.peers, magnet: Some(magnet), link: None,
+                indexer: "Knaben".into(), rating: None }
+        })
+        .collect())
+}
+
+// ---- Bitsearch (JSON GET) ----
+
+fn search_bitsearch(query: &str) -> Result<Vec<SearchResult>> {
+    #[derive(Deserialize)]
+    struct Item {
+        #[serde(default)] infohash: String,
+        #[serde(default)] title: String,
+        #[serde(default)] size: u64,
+        #[serde(default)] seeders: i64,
+        #[serde(default)] leechers: i64,
+    }
+    #[derive(Deserialize)]
+    struct Resp { #[serde(default)] results: Vec<Item> }
+
+    let url = format!("https://bitsearch.to/api/v1/search?q={}&sort=seeders&limit=50", urlencode(query));
+    let resp = minreq::get(&url)
+        .with_header("User-Agent", UA)
+        .with_timeout(10)
+        .send()
+        .context("bitsearch unreachable")?;
+    if resp.status_code >= 400 { bail!("HTTP {}", resp.status_code); }
+    let r: Resp = resp.json().context("bad JSON")?;
+    Ok(r.results.into_iter()
+        .filter(|i| !i.infohash.is_empty() && !i.title.is_empty())
+        .map(|i| SearchResult {
+            magnet: Some(build_magnet(&i.infohash, &i.title)),
+            title: i.title, size: i.size, seeders: i.seeders, leechers: i.leechers,
+            link: None, indexer: "Bitsearch".into(), rating: None,
+        })
+        .collect())
+}
+
+// ---- Torrents-CSV (JSON GET) ----
+
+fn search_torrents_csv(query: &str) -> Result<Vec<SearchResult>> {
+    #[derive(Deserialize)]
+    struct Item {
+        #[serde(default)] name: String,
+        #[serde(default)] infohash: String,
+        #[serde(default)] size_bytes: u64,
+        #[serde(default)] seeders: i64,
+        #[serde(default)] leechers: i64,
+    }
+    #[derive(Deserialize)]
+    struct Resp { #[serde(default)] torrents: Vec<Item> }
+
+    let url = format!("https://torrents-csv.com/service/search?q={}&size=50", urlencode(query));
+    let resp = minreq::get(&url)
+        .with_header("User-Agent", UA)
+        .with_timeout(10)
+        .send()
+        .context("torrents-csv unreachable")?;
+    if resp.status_code >= 400 { bail!("HTTP {}", resp.status_code); }
+    let r: Resp = resp.json().context("bad JSON")?;
+    Ok(r.torrents.into_iter()
+        .filter(|t| !t.infohash.is_empty() && !t.name.is_empty())
+        .map(|t| SearchResult {
+            magnet: Some(build_magnet(&t.infohash, &t.name)),
+            title: t.name, size: t.size_bytes, seeders: t.seeders, leechers: t.leechers,
+            link: None, indexer: "TorrentsCSV".into(), rating: None,
+        })
+        .collect())
+}
+
+// ---- YTS (JSON GET, movies) ----
+
+fn search_yts(query: &str) -> Result<Vec<SearchResult>> {
+    #[derive(Deserialize)]
+    struct Torrent {
+        #[serde(default)] hash: String,
+        #[serde(default)] size_bytes: u64,
+        #[serde(default)] seeds: i64,
+        #[serde(default)] peers: i64,
+        #[serde(default)] quality: String,
+    }
+    #[derive(Deserialize)]
+    struct Movie {
+        #[serde(default)] title_long: String,
+        #[serde(default)] torrents: Vec<Torrent>,
+    }
+    #[derive(Deserialize)]
+    struct Data { #[serde(default)] movies: Vec<Movie> }
+    #[derive(Deserialize)]
+    struct Resp { #[serde(default)] data: Data }
+
+    let url = format!(
+        "https://yts.mx/api/v2/list_movies.json?query_term={}&limit=50&sort_by=seeds",
+        urlencode(query)
+    );
+    let resp = minreq::get(&url)
+        .with_header("User-Agent", UA)
+        .with_timeout(10)
+        .send()
+        .context("yts unreachable")?;
+    if resp.status_code >= 400 { bail!("HTTP {}", resp.status_code); }
+    let r: Resp = resp.json().context("bad JSON")?;
+    let mut results = Vec::new();
+    for movie in r.data.movies {
+        for t in movie.torrents {
+            if t.hash.is_empty() { continue; }
+            let title = format!("{} [{}]", movie.title_long, t.quality);
+            results.push(SearchResult {
+                magnet: Some(build_magnet(&t.hash, &title)),
+                title, size: t.size_bytes, seeders: t.seeds, leechers: t.peers,
+                link: None, indexer: "YTS".into(), rating: None,
+            });
+        }
+    }
+    Ok(results)
+}
+
+// ---- Nyaa (RSS, anime/general) ----
+
+fn search_nyaa(query: &str) -> Result<Vec<SearchResult>> {
+    let url = format!("https://nyaa.si/?page=rss&q={}&c=0_0&f=0", urlencode(query));
+    let resp = minreq::get(&url)
+        .with_header("User-Agent", UA)
+        .with_timeout(10)
+        .send()
+        .context("nyaa unreachable")?;
+    if resp.status_code >= 400 { bail!("HTTP {}", resp.status_code); }
+    let xml = resp.as_str().context("non-utf8")?;
+    let mut results = Vec::new();
+    for item in xml.split("<item>").skip(1) {
+        let title = extract_between(item, "<title><![CDATA[", "]]>")
+            .or_else(|| extract_between(item, "<title>", "</title>"))
+            .unwrap_or_default();
+        if title.is_empty() { continue; }
+        let hash = extract_between(item, "<nyaa:infoHash>", "</nyaa:infoHash>")
+            .unwrap_or_default();
+        // Fall back to the .torrent enclosure URL (rqbit can add it directly).
+        let torrent_url = extract_between(item, "enclosure url=\"", "\"");
+        if hash.is_empty() && torrent_url.is_none() { continue; }
+        let magnet = if !hash.is_empty() { Some(build_magnet(&hash, &title)) } else { None };
+        let link = if magnet.is_none() { torrent_url } else { None };
+        let seeders = extract_between(item, "<nyaa:seeders>", "</nyaa:seeders>")
+            .and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+        let leechers = extract_between(item, "<nyaa:leechers>", "</nyaa:leechers>")
+            .and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+        let size = extract_between(item, "<nyaa:size>", "</nyaa:size>")
+            .map(|s| parse_size(&s)).unwrap_or(0);
+        results.push(SearchResult { title, size, seeders, leechers, magnet, link,
+            indexer: "Nyaa".into(), rating: None });
+    }
+    Ok(results)
+}
+
+// ---- Solidtorrents (HTML scrape) ----
+
+fn search_solidtorrents(query: &str) -> Result<Vec<SearchResult>> {
+    let url = format!("https://solidtorrents.to/search?q={}", urlencode(query));
+    let resp = minreq::get(&url)
+        .with_header("User-Agent", UA)
+        .with_header("Accept", "text/html,application/xhtml+xml")
+        .with_timeout(10)
+        .send()
+        .context("solidtorrents unreachable")?;
+    if resp.status_code >= 400 { bail!("HTTP {}", resp.status_code); }
+    let html = resp.as_str().context("non-utf8")?;
+    let mut results = Vec::new();
+    for chunk in html.split("search-result").skip(1) {
+        let title = extract_between(chunk, "class=\"title\">", "</")
+            .or_else(|| extract_between(chunk, "<h5>", "</h5>"))
+            .map(|t| t.trim().replace("&amp;", "&").to_string())
+            .unwrap_or_default();
+        if title.is_empty() { continue; }
+        let magnet = extract_between(chunk, "href=\"magnet:", "\"")
+            .map(|m| format!("magnet:{}", m));
+        let seeders = extract_between(chunk, "Seeds</font>", "<")
+            .or_else(|| extract_between(chunk, "seeds\">", "<"))
+            .and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+        let leechers = extract_between(chunk, "Peers</font>", "<")
+            .or_else(|| extract_between(chunk, "leeches\">", "<"))
+            .and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+        let size = extract_between(chunk, "Size</font>", "<")
+            .map(|s| parse_size(s.trim())).unwrap_or(0);
+        if magnet.is_none() { continue; }
+        results.push(SearchResult { title, size, seeders, leechers, magnet, link: None,
+            indexer: "Solidtorrents".into(), rating: None });
+    }
+    results.sort_by(|a, b| b.seeders.cmp(&a.seeders));
+    Ok(results)
+}
+
+// ---- BT4G (HTML scrape) ----
+
+fn search_bt4g(query: &str) -> Result<Vec<SearchResult>> {
+    let url = format!("https://bt4g.com/search/{}/seeders/1/", urlencode(query));
+    let resp = minreq::get(&url)
+        .with_header("User-Agent", UA)
+        .with_header("Accept", "text/html,application/xhtml+xml")
+        .with_timeout(10)
+        .send()
+        .context("bt4g unreachable")?;
+    if resp.status_code >= 400 { bail!("HTTP {}", resp.status_code); }
+    let html = resp.as_str().context("non-utf8")?;
+    let mut results = Vec::new();
+    for chunk in html.split("magnet:?").skip(1) {
+        let magnet_tail = match chunk.find('"').or_else(|| chunk.find('\'')) {
+            Some(i) => &chunk[..i],
+            None => continue,
+        };
+        let magnet = format!("magnet:?{}", magnet_tail);
+        // Extract dn= from the magnet as the title
+        let title = magnet_tail.split("&dn=").nth(1)
+            .and_then(|s| s.split('&').next())
+            .map(|s| s.replace('+', " "))
+            .map(|s| percent_decode(&s))
+            .unwrap_or_default();
+        if title.is_empty() { continue; }
+        // Size and seeders are in nearby text
+        let seeders = extract_between(chunk, "seeders\">", "<")
+            .or_else(|| extract_between(chunk, "seed\">", "<"))
+            .and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+        let size = extract_between(chunk, "size\">", "<")
+            .map(|s| parse_size(s.trim())).unwrap_or(0);
+        results.push(SearchResult { title, size, seeders, leechers: 0,
+            magnet: Some(magnet), link: None, indexer: "BT4G".into(), rating: None });
+    }
+    results.sort_by(|a, b| b.seeders.cmp(&a.seeders));
+    Ok(results)
+}
+
+fn percent_decode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut bytes = s.bytes().peekable();
+    while let Some(b) = bytes.next() {
+        if b == b'%' {
+            let h1 = bytes.next().unwrap_or(b'0') as char;
+            let h2 = bytes.next().unwrap_or(b'0') as char;
+            if let Ok(n) = u8::from_str_radix(&format!("{}{}", h1, h2), 16) {
+                out.push(n as char);
+                continue;
+            }
+        }
+        out.push(b as char);
+    }
+    out
 }
 
 fn build_magnet(hash: &str, name: &str) -> String {
