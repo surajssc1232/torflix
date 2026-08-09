@@ -139,7 +139,6 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                 let n_rows = app.rows_snapshot().len();
                 match app.view {
                     View::Home => {
-                        let query_empty = app.search_query.is_empty();
                         match key.code {
                             KeyCode::Enter => app.start_search(),
                             KeyCode::Backspace => { app.search_query.pop(); }
@@ -147,15 +146,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                 app.search_query.clear();
                             }
-                            // Navigation shortcuts only work when search bar is empty
-                            KeyCode::Char('q') if query_empty => app.should_quit = true,
-                            KeyCode::Char('t') if query_empty => {
+                            // Tab goes to downloads — Tab never appears in a search query
+                            KeyCode::Tab => {
                                 app.view = View::Torrents;
                                 app.status = "a: add magnet/URL  Enter: files  Space: pause  q: quit".into();
-                            }
-                            KeyCode::Char('a') if query_empty => {
-                                app.input.clear();
-                                app.view = View::AddInput;
                             }
                             KeyCode::Char(c) => app.search_query.push(c),
                             _ => {}

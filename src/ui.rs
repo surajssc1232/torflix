@@ -152,7 +152,7 @@ fn draw_home(f: &mut Frame, area: Rect, app: &App) {
             let hint_rect = Rect { x: area.x, y: hint_y, width: area.width, height: 1 };
             f.render_widget(
                 Paragraph::new(Span::styled(
-                    "t: downloads   a: add magnet   q: quit",
+                    "Tab: downloads   q: quit (from downloads)",
                     Style::default().fg(GRAY),
                 ))
                 .alignment(Alignment::Center),
@@ -310,7 +310,7 @@ fn status_style(status: &str) -> (String, Style) {
 
 fn draw_help(f: &mut Frame, area: Rect, app: &App) {
     let help = match app.view {
-        View::Home          => " Enter: search   t: downloads   a: add magnet   q: quit   ?: help",
+        View::Home          => " Enter: search   Tab: downloads   Esc: clear   ?: help",
         View::Files         => " Enter: play   p: playlist   j/k: move   Esc: back   q: quit",
         View::SearchResults => " Enter: stream   d: download   o: sort   s: new search   j/k   Esc: back",
         View::ConfirmDelete => " y: confirm   n/Esc: cancel",
@@ -346,8 +346,7 @@ fn draw_help_popup(f: &mut Frame, area: Rect) {
         row("type",        "type to build search query"),
         row("Enter",       "search for the typed query"),
         row("Esc",         "clear search query"),
-        row("t",           "go to downloads (when query is empty)"),
-        row("a",           "add magnet link (when query is empty)"),
+        row("Tab",         "go to downloads view"),
         Line::from(""),
         section("Search Results"),
         row("Enter",       "stream selected result"),
