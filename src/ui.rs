@@ -124,19 +124,19 @@ fn draw_home(f: &mut Frame, area: Rect, app: &App) {
         q.clone()
     };
 
-    let placeholder = if q.is_empty() {
-        Span::styled("search for a movie or show…", Style::default().fg(GRAY))
-    } else {
-        Span::raw("")
-    };
-
     let p = Paragraph::new(vec![
-        Line::from(vec![
-            Span::styled("  › ", Style::default().fg(AQUA).add_modifier(Modifier::BOLD)),
-            Span::styled(shown, Style::default().fg(FG)),
-            placeholder,
-            Span::styled("█", Style::default().fg(AQUA)),
-        ]),
+        Line::from(if q.is_empty() {
+            vec![
+                Span::styled("  › ", Style::default().fg(AQUA).add_modifier(Modifier::BOLD)),
+                Span::styled("search for a movie or show…", Style::default().fg(GRAY)),
+            ]
+        } else {
+            vec![
+                Span::styled("  › ", Style::default().fg(AQUA).add_modifier(Modifier::BOLD)),
+                Span::styled(shown, Style::default().fg(FG)),
+                Span::styled("█", Style::default().fg(AQUA)),
+            ]
+        }),
     ])
     .block(
         Block::default()
