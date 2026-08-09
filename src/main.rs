@@ -1,5 +1,4 @@
 mod app;
-mod letterboxd;
 mod omdb;
 mod rqbit;
 mod search;
@@ -7,7 +6,6 @@ mod ui;
 
 use anyhow::Result;
 use app::{App, View};
-use letterboxd::ListKind;
 use crossterm::{
     event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
@@ -68,12 +66,10 @@ fn main() -> Result<()> {
         }
     }
 
-    // Clean up any temp dirs left behind by a previous crash.
     purge_stale_temp_dirs();
 
     let mut app = App::new(client);
     app.spawn_poller();
-    app.browse_popular(ListKind::PopularThisWeek); // open popular view on boot
 
     // Add anything passed on the command line (magnet, URL, or .torrent path).
     for arg in std::env::args().skip(1) {
@@ -84,7 +80,6 @@ fn main() -> Result<()> {
         app.add_and_play_async(&arg, &label);
     }
 
-    // Terminal setup with panic-safe restore.
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
@@ -117,9 +112,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
             app.status = msg;
         }
 
-        if app.view == View::Popular {
-            app.maybe_fetch_ratings();
-        } else if app.view == View::SearchResults {
+        if app.view == View::SearchResults {
             app.maybe_fetch_search_ratings();
         }
 
@@ -131,7 +124,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
         match event::read()? {
             Event::Paste(text) => match app.view {
                 View::AddInput => app.input.push_str(&text),
-                View::SearchInput => app.search_query.push_str(&text),
+                View::Home => app.search_query.push_str(&text),
                 _ => {}
             },
             Event::Key(key) if key.kind == KeyEventKind::Press => {
@@ -145,39 +138,50 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                 }
                 let n_rows = app.rows_snapshot().len();
                 match app.view {
+                    View::Home => {
+                        let query_empty = app.search_query.is_empty();
+                        match key.code {
+                            KeyCode::Enter => app.start_search(),
+                            KeyCode::Backspace => { app.search_query.pop(); }
+                            KeyCode::Esc => app.search_query.clear(),
+                            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                app.search_query.clear();
+                            }
+                            // Navigation shortcuts only work when search bar is empty
+                            KeyCode::Char('q') if query_empty => app.should_quit = true,
+                            KeyCode::Char('t') if query_empty => {
+                                app.view = View::Torrents;
+                                app.status = "a: add magnet/URL  Enter: files  Space: pause  q: quit".into();
+                            }
+                            KeyCode::Char('a') if query_empty => {
+                                app.input.clear();
+                                app.view = View::AddInput;
+                            }
+                            KeyCode::Char(c) => app.search_query.push(c),
+                            _ => {}
+                        }
+                    }
                     View::AddInput => match key.code {
                         KeyCode::Esc => {
                             app.input.clear();
-                            app.view = View::Torrents;
+                            app.view = View::Home;
                         }
                         KeyCode::Enter => app.submit_add(),
-                        KeyCode::Backspace => {
-                            app.input.pop();
-                        }
+                        KeyCode::Backspace => { app.input.pop(); }
                         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             app.input.clear();
                         }
                         KeyCode::Char(c) => app.input.push(c),
                         _ => {}
                     },
-                    View::SearchInput => match key.code {
-                        KeyCode::Esc => app.view = app.search_origin.clone(),
-                        KeyCode::Enter => app.start_search(),
-                        KeyCode::Backspace => {
-                            app.search_query.pop();
-                        }
-                        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            app.search_query.clear();
-                        }
-                        KeyCode::Char(c) => app.search_query.push(c),
-                        _ => {}
-                    },
                     View::SearchResults => match key.code {
-                        KeyCode::Esc | KeyCode::Char('h') => app.view = app.search_origin.clone(),
+                        KeyCode::Esc | KeyCode::Char('h') => {
+                            app.view = View::Home;
+                        }
                         KeyCode::Char('q') => app.should_quit = true,
                         KeyCode::Char('s') | KeyCode::Char('/') => {
                             app.search_query.clear();
-                            app.view = View::SearchInput;
+                            app.view = View::Home;
                         }
                         KeyCode::Up | KeyCode::Char('k') => {
                             app.search_selected = app.search_selected.saturating_sub(1);
@@ -196,52 +200,6 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                         }
                         _ => {}
                     },
-                    View::Popular => match key.code {
-                        KeyCode::Esc | KeyCode::Char('h') => {
-                            app.view = View::Torrents;
-                            app.status =
-                                "a: add magnet/URL  Enter: files  Space: pause  q: quit".into();
-                        }
-                        KeyCode::Char('q') => app.should_quit = true,
-                        KeyCode::Char('s') | KeyCode::Char('/') => {
-                            app.search_origin = View::Popular;
-                            app.search_query.clear();
-                            app.view = View::SearchInput;
-                        }
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            app.popular_selected = app.popular_selected.saturating_sub(1);
-                        }
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            let n = app.popular_len();
-                            if n > 0 {
-                                app.popular_selected = (app.popular_selected + 1).min(n - 1);
-                            }
-                        }
-                        KeyCode::Enter | KeyCode::Char('l') => app.search_popular_selected(),
-                        // Tab / left-right to switch list kind
-                        KeyCode::Tab | KeyCode::Right | KeyCode::Char('L') => {
-                            let next = match app.popular_list {
-                                ListKind::Popular => ListKind::PopularThisWeek,
-                                ListKind::PopularThisWeek => ListKind::PopularThisMonth,
-                                ListKind::PopularThisMonth => ListKind::TopRated,
-                                ListKind::TopRated => ListKind::Popular,
-                            };
-                            app.browse_popular(next);
-                        }
-                        KeyCode::BackTab | KeyCode::Left | KeyCode::Char('H') => {
-                            let prev = match app.popular_list {
-                                ListKind::Popular => ListKind::TopRated,
-                                ListKind::PopularThisWeek => ListKind::Popular,
-                                ListKind::PopularThisMonth => ListKind::PopularThisWeek,
-                                ListKind::TopRated => ListKind::PopularThisMonth,
-                            };
-                            app.browse_popular(prev);
-                        }
-                        KeyCode::Char('r') => app.popular_refresh(),
-                        KeyCode::Char(']') => app.popular_next_page(),
-                        KeyCode::Char('[') => app.popular_prev_page(),
-                        _ => {}
-                    },
                     View::ConfirmDelete => match key.code {
                         KeyCode::Char('y') | KeyCode::Char('Y') => app.confirm_delete(),
                         _ => app.view = View::Torrents,
@@ -249,8 +207,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                     View::Files => match key.code {
                         KeyCode::Esc | KeyCode::Char('h') | KeyCode::Backspace => {
                             app.view = View::Torrents;
-                            app.status =
-                                "a: add magnet/URL  Enter: files  Space: pause  q: quit".into();
+                            app.status = "a: add magnet/URL  Enter: files  Space: pause  q: quit".into();
                         }
                         KeyCode::Char('q') => app.should_quit = true,
                         KeyCode::Up | KeyCode::Char('k') => {
@@ -258,8 +215,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                         }
                         KeyCode::Down | KeyCode::Char('j') => {
                             if !app.files.is_empty() {
-                                app.file_selected =
-                                    (app.file_selected + 1).min(app.files.len() - 1);
+                                app.file_selected = (app.file_selected + 1).min(app.files.len() - 1);
                             }
                         }
                         KeyCode::Enter | KeyCode::Char('l') => app.play_selected_file(),
@@ -276,12 +232,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                             app.input.clear();
                             app.view = View::AddInput;
                         }
-                        KeyCode::Char('s') | KeyCode::Char('/') => {
-                            app.search_origin = View::Torrents;
+                        KeyCode::Char('s') | KeyCode::Char('/') | KeyCode::Esc => {
                             app.search_query.clear();
-                            app.view = View::SearchInput;
+                            app.view = View::Home;
                         }
-                        KeyCode::Char('b') => app.browse_popular(ListKind::Popular),
                         KeyCode::Up | KeyCode::Char('k') => {
                             app.selected = app.selected.saturating_sub(1);
                         }

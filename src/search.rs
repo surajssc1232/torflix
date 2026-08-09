@@ -3,6 +3,8 @@
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 const UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
                   (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
@@ -67,9 +69,9 @@ pub fn backend_from_env() -> Option<Backend> {
     Some(Backend::Builtin)
 }
 
-pub fn search(backend: &Backend, query: &str) -> Result<Vec<SearchResult>> {
+pub fn search(backend: &Backend, query: &str, partial: &Arc<Mutex<Vec<SearchResult>>>) -> Result<Vec<SearchResult>> {
     match backend {
-        Backend::Builtin => search_builtin(query),
+        Backend::Builtin => search_builtin(query, partial),
         Backend::Prowlarr { url, apikey } => {
             check_scheme(url)?;
             let url = format!(
@@ -100,37 +102,50 @@ pub fn search(backend: &Backend, query: &str) -> Result<Vec<SearchResult>> {
 // then falls back to apibay.org (Pirate Bay JSON API) on failure or empty.
 // ============================================================================
 
-fn search_builtin(query: &str) -> Result<Vec<SearchResult>> {
-    let mut all: Vec<SearchResult> = Vec::new();
-    let mut errors: Vec<String> = Vec::new();
+fn search_builtin(query: &str, partial: &Arc<Mutex<Vec<SearchResult>>>) -> Result<Vec<SearchResult>> {
+    type Msg = (&'static str, Result<Vec<SearchResult>>);
+    let (tx, rx) = std::sync::mpsc::channel::<Msg>();
 
-    macro_rules! src {
-        ($name:expr, $call:expr) => {
-            match $call {
-                Ok(r) => all.extend(r),
-                Err(e) => errors.push(format!("{}: {}", $name, e)),
+    let sources: &[(&'static str, fn(&str) -> Result<Vec<SearchResult>>)] = &[
+        ("Knaben",        search_knaben),
+        ("apibay",        search_apibay),
+        ("TorrentsCSV",   search_torrents_csv),
+        ("Nyaa",          search_nyaa),
+        ("TorrentGalaxy", search_torrentgalaxy),
+        ("1337x",         search_1337x),
+    ];
+
+    for &(name, func) in sources {
+        let tx = tx.clone();
+        let q = query.to_string();
+        thread::spawn(move || { let _ = tx.send((name, func(&q))); });
+    }
+    drop(tx);
+
+    let mut errors: Vec<String> = Vec::new();
+    for _ in 0..sources.len() {
+        if let Ok((name, result)) = rx.recv() {
+            match result {
+                Ok(new_results) => {
+                    let mut lock = partial.lock().unwrap();
+                    lock.extend(new_results);
+                    lock.sort_by(|a, b| b.seeders.cmp(&a.seeders));
+                    let mut seen = std::collections::HashSet::new();
+                    lock.retain(|r| seen.insert(r.title.to_ascii_lowercase()));
+                }
+                Err(e) => errors.push(format!("{}: {}", name, e)),
             }
-        };
+        }
     }
 
-    src!("Knaben",       search_knaben(query));
-    src!("apibay",       search_apibay(query));
-    src!("TorrentsCSV",  search_torrents_csv(query));
-    src!("Nyaa",         search_nyaa(query));
-    src!("TorrentGalaxy",search_torrentgalaxy(query));
-    src!("1337x",        search_1337x(query));
-
-    if all.is_empty() {
+    let results = partial.lock().unwrap().clone();
+    if results.is_empty() {
         bail!(
             "no results — sources tried: {}\n\nIf results are empty, your ISP may be blocking torrent sites.\n→ Enable a VPN and try again, or set up Prowlarr for more sources (see README).",
             errors.join(" | ")
         );
     }
-
-    all.sort_by(|a, b| b.seeders.cmp(&a.seeders));
-    let mut seen = std::collections::HashSet::new();
-    all.retain(|r| seen.insert(r.title.to_ascii_lowercase()));
-    Ok(all)
+    Ok(results)
 }
 
 // ---- TorrentGalaxy (HTML scrape, magnets inline in search results) ----
@@ -654,7 +669,8 @@ mod search_tests {
             url: "http://127.0.0.1:9911".into(),
             apikey: "k".into(),
         };
-        match search(&backend, "big buck bunny") {
+        let partial = Arc::new(Mutex::new(vec![]));
+        match search(&backend, "big buck bunny", &partial) {
             Ok(results) => {
                 assert_eq!(results.len(), 3);
                 assert_eq!(results[0].seeders, 152);
@@ -678,7 +694,8 @@ mod search_tests {
             url: "http://127.0.0.1:9911".into(),
             apikey: "k".into(),
         };
-        if let Ok(results) = search(&backend, "sintel") {
+        let partial = Arc::new(Mutex::new(vec![]));
+        if let Ok(results) = search(&backend, "sintel", &partial) {
             assert_eq!(results.len(), 1);
             assert_eq!(results[0].seeders, 88);
             assert_eq!(results[0].leechers, 7);
@@ -690,7 +707,8 @@ mod search_tests {
     #[test]
     fn https_rejected_with_hint() {
         let backend = Backend::Prowlarr { url: "https://x".into(), apikey: "".into() };
-        let e = search(&backend, "q").unwrap_err().to_string();
+        let partial = Arc::new(Mutex::new(vec![]));
+        let e = search(&backend, "q", &partial).unwrap_err().to_string();
         assert!(e.contains("http"));
     }
 

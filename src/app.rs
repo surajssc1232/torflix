@@ -1,4 +1,3 @@
-use crate::letterboxd::{self, ListKind, Movie};
 use crate::omdb;
 use crate::rqbit::{Client, FileDetails, TorrentStats};
 use crate::search::{self, SearchResult};
@@ -51,25 +50,17 @@ pub struct TorrentRow {
 
 #[derive(PartialEq, Clone)]
 pub enum View {
+    Home,
     Torrents,
     Files,
     AddInput,
     ConfirmDelete,
-    SearchInput,
     SearchResults,
-    Popular,
-}
-
-pub enum PopularStatus {
-    Idle,
-    Loading,
-    Done(Vec<Movie>),
-    Failed(String),
 }
 
 pub enum SearchStatus {
     Idle,
-    Searching,
+    Searching(Arc<Mutex<Vec<SearchResult>>>),
     Done(Vec<SearchResult>),
     Failed(String),
 }
@@ -122,13 +113,6 @@ pub struct App {
     pub search: Arc<Mutex<SearchStatus>>,
     pub search_selected: usize,
     pub search_sort: SortMode,
-    pub search_origin: View,   // which view to return to on Esc from SearchResults
-
-    // Popular (Letterboxd)
-    pub popular: Arc<Mutex<PopularStatus>>,
-    pub popular_selected: usize,
-    pub popular_list: ListKind,
-    pub popular_page: usize,
 
     // Ratings cache (IMDb + RT via OMDb, keyed by "title|year")
     pub ratings: Arc<Mutex<HashMap<String, omdb::Ratings>>>,
@@ -149,7 +133,7 @@ impl App {
         let (status_tx, status_rx) = channel();
         Self {
             client,
-            view: View::Torrents,
+            view: View::Home,
             rows: Arc::new(Mutex::new(Vec::new())),
             engine_up: Arc::new(Mutex::new(true)),
             selected: 0,
@@ -163,11 +147,6 @@ impl App {
             search: Arc::new(Mutex::new(SearchStatus::Idle)),
             search_selected: 0,
             search_sort: SortMode::Seeders,
-            search_origin: View::Torrents,
-            popular: Arc::new(Mutex::new(PopularStatus::Idle)),
-            popular_selected: 0,
-            popular_list: ListKind::Popular,
-            popular_page: 1,
             ratings: Arc::new(Mutex::new(HashMap::new())),
             ratings_fetching: Arc::new(Mutex::new(None)),
             status_tx,
@@ -430,17 +409,16 @@ impl App {
         if q.is_empty() {
             return;
         }
-        // Always Some — falls back to Backend::Builtin (scraper) when unconfigured.
         let backend = search::backend_from_env().expect("backend_from_env always returns Some");
-        *self.search.lock().unwrap() = SearchStatus::Searching;
+        let partial: Arc<Mutex<Vec<SearchResult>>> = Arc::new(Mutex::new(Vec::new()));
+        *self.search.lock().unwrap() = SearchStatus::Searching(Arc::clone(&partial));
         self.search_selected = 0;
-        self.search_sort = SortMode::Seeders; // reset to default on new search
-        // search_origin is set by the caller (key handler or search_popular_selected)
+        self.search_sort = SortMode::Seeders;
         self.view = View::SearchResults;
         self.status = format!("searching {} for '{}' …", backend.name(), q);
         let state = Arc::clone(&self.search);
         thread::spawn(move || {
-            let out = match search::search(&backend, &q) {
+            let out = match search::search(&backend, &q, &partial) {
                 Ok(v) => SearchStatus::Done(v),
                 Err(e) => SearchStatus::Failed(e.to_string()),
             };
@@ -451,6 +429,7 @@ impl App {
     pub fn search_results_len(&self) -> usize {
         match &*self.search.lock().unwrap() {
             SearchStatus::Done(v) => v.len(),
+            SearchStatus::Searching(partial) => partial.lock().unwrap().len(),
             _ => 0,
         }
     }
@@ -469,6 +448,11 @@ impl App {
         let picked: Option<SearchResult> = match &*self.search.lock().unwrap() {
             SearchStatus::Done(v) => {
                 let sorted = self.sort_results(v);
+                sorted.get(self.search_selected).map(|r| (*r).clone())
+            }
+            SearchStatus::Searching(partial) => {
+                let v = partial.lock().unwrap();
+                let sorted = self.sort_results(&v);
                 sorted.get(self.search_selected).map(|r| (*r).clone())
             }
             _ => None,
@@ -509,6 +493,11 @@ impl App {
                 let sorted = self.sort_results(v);
                 sorted.get(self.search_selected).map(|r| (*r).clone())
             }
+            SearchStatus::Searching(partial) => {
+                let v = partial.lock().unwrap();
+                let sorted = self.sort_results(&v);
+                sorted.get(self.search_selected).map(|r| (*r).clone())
+            }
             _ => None,
         };
         let Some(r) = picked else { return };
@@ -518,88 +507,6 @@ impl App {
                 self.add_and_play_async(&target, &r.title);
             }
             None => self.status = "✗ result has no magnet or download link".into(),
-        }
-    }
-
-    // ---------- popular (letterboxd) ----------
-
-    pub fn browse_popular(&mut self, kind: ListKind) {
-        self.popular_list = kind;
-        self.popular_page = 1;
-        self.popular_selected = 0;
-        self.view = View::Popular;
-        self.load_popular_page();
-    }
-
-    pub fn popular_next_page(&mut self) {
-        self.popular_page += 1;
-        self.popular_selected = 0;
-        self.load_popular_page();
-    }
-
-    pub fn popular_prev_page(&mut self) {
-        if self.popular_page > 1 {
-            self.popular_page -= 1;
-            self.popular_selected = 0;
-            self.load_popular_page();
-        }
-    }
-
-    pub fn popular_refresh(&mut self) {
-        self.popular_selected = 0;
-        self.load_popular_page();
-    }
-
-    fn load_popular_page(&mut self) {
-        let page = self.popular_page;
-        *self.popular.lock().unwrap() = PopularStatus::Loading;
-        self.status = if page > 1 {
-            format!("loading {} page {} from Letterboxd…", self.popular_list.label(), page)
-        } else {
-            format!("loading {} from Letterboxd…", self.popular_list.label())
-        };
-
-        let state = Arc::clone(&self.popular);
-        let kind = match &self.popular_list {
-            ListKind::Popular => ListKind::Popular,
-            ListKind::PopularThisWeek => ListKind::PopularThisWeek,
-            ListKind::PopularThisMonth => ListKind::PopularThisMonth,
-            ListKind::TopRated => ListKind::TopRated,
-        };
-        thread::spawn(move || {
-            let out = match letterboxd::fetch(&kind, page) {
-                Ok(v) if v.is_empty() => PopularStatus::Failed(
-                    "no films found on this page".into(),
-                ),
-                Ok(v) => PopularStatus::Done(v),
-                Err(e) => PopularStatus::Failed(e.to_string()),
-            };
-            *state.lock().unwrap() = out;
-        });
-    }
-
-    pub fn popular_len(&self) -> usize {
-        match &*self.popular.lock().unwrap() {
-            PopularStatus::Done(v) => v.len(),
-            _ => 0,
-        }
-    }
-
-    /// Search for the selected popular movie via Prowlarr/Jackett.
-    pub fn search_popular_selected(&mut self) {
-        let movie = match &*self.popular.lock().unwrap() {
-            PopularStatus::Done(v) => v.get(self.popular_selected).cloned(),
-            _ => None,
-        };
-        if let Some(m) = movie {
-            let query = if m.year.is_empty() {
-                m.title.clone()
-            } else {
-                format!("{} {}", m.title, m.year)
-            };
-            self.search_origin = View::Popular;
-            self.search_query = query;
-            self.start_search();
         }
     }
 
@@ -647,36 +554,6 @@ impl App {
         } else {
             String::new()
         }
-    }
-
-    /// Lazily fetch OMDb ratings for the currently highlighted popular film.
-    pub fn maybe_fetch_ratings(&self) {
-        let Some(api_key) = std::env::var("TORFLIX_OMDB_KEY").ok() else { return };
-        let (title, year) = {
-            let lock = self.popular.lock().unwrap();
-            match &*lock {
-                PopularStatus::Done(v) => match v.get(self.popular_selected) {
-                    Some(m) => (m.title.clone(), m.year.clone()),
-                    None => return,
-                },
-                _ => return,
-            }
-        };
-        self.fetch_ratings_for(&title, &year, &api_key);
-    }
-
-    pub fn popular_ratings_line(&self) -> String {
-        let (title, year) = {
-            let lock = self.popular.lock().unwrap();
-            match &*lock {
-                PopularStatus::Done(v) => match v.get(self.popular_selected) {
-                    Some(m) => (m.title.clone(), m.year.clone()),
-                    None => return String::new(),
-                },
-                _ => return String::new(),
-            }
-        };
-        self.ratings_line_for(&title, &year)
     }
 
     /// Lazily fetch OMDb ratings for the current search query (one lookup per search).
