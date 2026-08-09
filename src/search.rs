@@ -1,7 +1,11 @@
-//! Torrent search via Prowlarr or Jackett.
+//! Torrent search. Uses Prowlarr/Jackett when configured, otherwise falls
+//! back to a built-in scraper of public torrent sites (TorrentGalaxy → apibay).
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
+
+const UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
+                  (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
 #[derive(Debug, Clone)]
 pub struct SearchResult {
@@ -28,6 +32,7 @@ impl SearchResult {
 pub enum Backend {
     Prowlarr { url: String, apikey: String },
     Jackett { url: String, apikey: String },
+    Builtin, // scrape public torrent sites — no setup required
 }
 
 impl Backend {
@@ -35,11 +40,12 @@ impl Backend {
         match self {
             Backend::Prowlarr { .. } => "prowlarr",
             Backend::Jackett { .. } => "jackett",
+            Backend::Builtin => "built-in",
         }
     }
 }
 
-/// Returns the configured backend, or None if neither Prowlarr nor Jackett is set.
+/// Prowlarr/Jackett if configured (via env vars), otherwise the built-in scraper.
 pub fn backend_from_env() -> Option<Backend> {
     let clean = |s: String| s.trim().trim_end_matches('/').to_string();
     if let Ok(url) = std::env::var("TORFLIX_PROWLARR_URL") {
@@ -58,11 +64,12 @@ pub fn backend_from_env() -> Option<Backend> {
             });
         }
     }
-    None
+    Some(Backend::Builtin)
 }
 
 pub fn search(backend: &Backend, query: &str) -> Result<Vec<SearchResult>> {
     match backend {
+        Backend::Builtin => search_builtin(query),
         Backend::Prowlarr { url, apikey } => {
             check_scheme(url)?;
             let url = format!(
@@ -86,6 +93,198 @@ pub fn search(backend: &Backend, query: &str) -> Result<Vec<SearchResult>> {
             parse_jackett(&body)
         }
     }
+}
+
+// ============================================================================
+// Built-in scraper: tries TorrentGalaxy first (fast, magnets in one page),
+// then falls back to apibay.org (Pirate Bay JSON API) on failure or empty.
+// ============================================================================
+
+fn search_builtin(query: &str) -> Result<Vec<SearchResult>> {
+    let mut errors: Vec<String> = Vec::new();
+
+    // apibay is tried first — its JSON endpoint is reachable from most
+    // networks that block full torrent sites (Cloudflare-fronted).
+    match search_apibay(query) {
+        Ok(r) if !r.is_empty() => return Ok(r),
+        Ok(_) => errors.push("apibay: no results".into()),
+        Err(e) => errors.push(format!("apibay: {}", e)),
+    }
+    // TorrentGalaxy as fallback for users on unrestricted networks.
+    match search_torrentgalaxy(query) {
+        Ok(r) if !r.is_empty() => return Ok(r),
+        Ok(_) => errors.push("TorrentGalaxy: no results".into()),
+        Err(e) => errors.push(format!("TorrentGalaxy: {}", e)),
+    }
+
+    bail!(
+        "no results.\nTried: {}\nIf every source failed, your network may be blocking torrent sites — try a VPN or set up Prowlarr (see README).",
+        errors.join(" | ")
+    )
+}
+
+// ---- TorrentGalaxy (HTML scrape, magnets inline in search results) ----
+// Layout inspected 2025-01: each result is a row with class "tgxtablerow"
+// containing a <a href="magnet:?xt=..."> and the title/size/seed/leech cells.
+
+fn search_torrentgalaxy(query: &str) -> Result<Vec<SearchResult>> {
+    let url = format!(
+        "https://torrentgalaxy.to/torrents.php?search={}&sort=seeders&order=desc",
+        urlencode(query)
+    );
+    let resp = minreq::get(&url)
+        .with_header("User-Agent", UA)
+        .with_header("Accept", "text/html,application/xhtml+xml")
+        .with_header("Accept-Language", "en-US,en;q=0.9")
+        .with_timeout(8) // fail fast if the site is ISP-blocked
+        .send()
+        .context("torrentgalaxy unreachable")?;
+    if resp.status_code >= 400 {
+        bail!("HTTP {}", resp.status_code);
+    }
+    let html = resp.as_str().context("non-utf8 response")?;
+    Ok(parse_torrentgalaxy(html))
+}
+
+fn parse_torrentgalaxy(html: &str) -> Vec<SearchResult> {
+    let mut results = Vec::new();
+    // Each row starts at `tgxtablerow` and ends at the next one (or end of doc).
+    for row in html.split("tgxtablerow").skip(1) {
+        // Skip adult categories entirely
+        let low = row.to_ascii_lowercase();
+        if low.contains("/cat/xxx") || low.contains(">xxx<") || low.contains("adult") {
+            continue;
+        }
+
+        // Magnet link
+        let Some(magnet) = extract_between(row, "href=\"magnet:", "\"")
+            .map(|m| format!("magnet:{}", m))
+        else { continue };
+
+        // Title: `title="..."` on the torrent detail link
+        let title = extract_between(row, "title=\"", "\"")
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| "unknown".to_string())
+            .replace("&amp;", "&");
+
+        // Size: usually inside `<span class="badge badge-secondary txlight">SIZE</span>`
+        let size = extract_between(row, "badge-secondary txlight\">", "<")
+            .map(|s| parse_size(&s))
+            .unwrap_or(0);
+
+        // Seeders: green cell; leechers: red cell. Both wrapped in <font color=...>
+        let seeders = extract_between(row, "<font color=\"green\"><b>", "<")
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(0);
+        let leechers = extract_between(row, "<font color=\"#ff0000\"><b>", "<")
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(0);
+
+        results.push(SearchResult {
+            title,
+            size,
+            seeders,
+            leechers,
+            magnet: Some(magnet),
+            link: None,
+            indexer: "TorrentGalaxy".into(),
+            rating: None,
+        });
+    }
+    results.sort_by(|a, b| b.seeders.cmp(&a.seeders));
+    results
+}
+
+// ---- apibay.org fallback (Pirate Bay JSON API) ----
+
+#[derive(Deserialize)]
+struct ApibayItem {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    info_hash: String,
+    #[serde(default)]
+    seeders: String,
+    #[serde(default)]
+    leechers: String,
+    #[serde(default)]
+    size: String,
+}
+
+fn search_apibay(query: &str) -> Result<Vec<SearchResult>> {
+    let url = format!("https://apibay.org/q.php?q={}&cat=200", urlencode(query));
+    // Try up to 3 times: 0s, 2s, 4s. Retries on 429 or TLS errors.
+    for delay_ms in [0u64, 2000, 4000] {
+        if delay_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        }
+        let resp = match minreq::get(&url)
+            .with_header("User-Agent", UA)
+            .with_timeout(20)
+            .send()
+        {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        if resp.status_code == 429 { continue; }
+        if resp.status_code >= 400 {
+            bail!("HTTP {}", resp.status_code);
+        }
+        let items: Vec<ApibayItem> = resp.json().context("bad JSON")?;
+        let zero_hash = "0000000000000000000000000000000000000000";
+        let mut results: Vec<SearchResult> = items
+            .into_iter()
+            .filter(|i| !i.info_hash.is_empty() && i.info_hash != zero_hash && !i.name.is_empty())
+            .map(|i| SearchResult {
+                title: i.name.clone(),
+                size: i.size.parse().unwrap_or(0),
+                seeders: i.seeders.parse().unwrap_or(0),
+                leechers: i.leechers.parse().unwrap_or(0),
+                magnet: Some(build_magnet(&i.info_hash, &i.name)),
+                link: None,
+                indexer: "TPB".into(),
+                rating: None,
+            })
+            .collect();
+        results.sort_by(|a, b| b.seeders.cmp(&a.seeders));
+        return Ok(results);
+    }
+    bail!("rate-limited after 3 attempts")
+}
+
+fn build_magnet(hash: &str, name: &str) -> String {
+    const TRACKERS: &[&str] = &[
+        "udp://tracker.opentrackr.org:1337/announce",
+        "udp://open.demonii.com:1337/announce",
+        "udp://tracker.openbittorrent.com:80",
+        "udp://p4p.arenabg.com:1337",
+    ];
+    let tr: String = TRACKERS.iter().map(|t| format!("&tr={}", t)).collect();
+    format!("magnet:?xt=urn:btih:{}&dn={}{}", hash, urlencode(name), tr)
+}
+
+fn parse_size(s: &str) -> u64 {
+    let s = s.trim();
+    let (num, unit) = s
+        .find(|c: char| c.is_alphabetic())
+        .map(|i| (&s[..i], s[i..].trim()))
+        .unwrap_or((s, ""));
+    let n: f64 = num.trim().parse().unwrap_or(0.0);
+    match unit.to_ascii_uppercase().as_str() {
+        "GB" | "GIB" => (n * 1_073_741_824.0) as u64,
+        "MB" | "MIB" => (n * 1_048_576.0) as u64,
+        "KB" | "KIB" => (n * 1_024.0) as u64,
+        _ => n as u64,
+    }
+}
+
+// Extract the substring between the first occurrence of `start` and the
+// next `end`. Returns None if either isn't found.
+fn extract_between(s: &str, start: &str, end: &str) -> Option<String> {
+    let i = s.find(start)? + start.len();
+    let rest = &s[i..];
+    let j = rest.find(end)?;
+    Some(rest[..j].to_string())
 }
 
 // ---------- Prowlarr ----------
@@ -286,5 +485,30 @@ mod search_tests {
         let backend = Backend::Prowlarr { url: "https://x".into(), apikey: "".into() };
         let e = search(&backend, "q").unwrap_err().to_string();
         assert!(e.contains("http"));
+    }
+
+    #[test]
+    fn extract_between_basic() {
+        assert_eq!(extract_between("hello [world] end", "[", "]"), Some("world".to_string()));
+        assert_eq!(extract_between("no brackets", "[", "]"), None);
+    }
+
+    #[test]
+    #[ignore]
+    fn live_torrentgalaxy_search() {
+        let results = search_torrentgalaxy("interstellar 2014").expect("TG unreachable");
+        println!("TG returned {} results", results.len());
+        for r in results.iter().take(5) {
+            println!("  {}s/{}l  {}  {}", r.seeders, r.leechers, crate::app::human_bytes(r.size), r.title);
+        }
+        assert!(!results.is_empty(), "TG returned zero results — parser probably needs updating");
+    }
+
+    #[test]
+    #[ignore]
+    fn live_apibay_search() {
+        let results = search_apibay("interstellar").expect("apibay unreachable");
+        println!("apibay returned {} results", results.len());
+        assert!(!results.is_empty());
     }
 }

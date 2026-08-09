@@ -2,7 +2,9 @@
 
 Stream movies in your terminal from magnet links and torrents — powered by [rqbit](https://github.com/ikatson/rqbit) + mpv/vlc.
 
-Browse popular movies from Letterboxd, search via Prowlarr or Jackett, paste any magnet link, and start watching in seconds. Nothing is kept on disk after playback ends.
+Browse popular movies from Letterboxd, search torrents out of the box (no Prowlarr required), paste any magnet link, and start watching in seconds. Nothing is kept on disk after playback ends.
+
+`cargo install torflix` — that's the whole setup.
 
 ```
  ▶ torflix  stream torrents in your terminal  engine: online
@@ -25,9 +27,9 @@ torflix auto-starts a local [rqbit](https://github.com/ikatson/rqbit) engine on 
 | Tool | Role | Required? |
 |------|------|-----------|
 | **rqbit** | BitTorrent engine (auto-started) | Yes — [download here](https://github.com/ikatson/rqbit/releases) |
-| **Prowlarr** or **Jackett** | Torrent search | Yes for search (see setup below) |
 | **mpv** | Media player | Recommended |
 | **vlc** | Media player | Alternative to mpv |
+| **Prowlarr** or **Jackett** | More torrent sources | Optional — built-in search works without them |
 
 If neither mpv nor vlc is found, the torrent is downloaded permanently to disk instead of streamed.
 
@@ -61,9 +63,19 @@ torflix "magnet:?xt=urn:btih:..."
 torflix ~/Downloads/movie.torrent
 ```
 
-## Setting up search (Prowlarr — recommended)
+## Search backends
 
-Prowlarr is a free, self-hosted app that connects to dozens of torrent indexers at once. Once running, torflix uses it automatically.
+torflix picks the first available backend automatically:
+
+1. **Prowlarr** — if `TORFLIX_PROWLARR_URL` is set (aggregates dozens of indexers)
+2. **Jackett** — if `TORFLIX_JACKETT_URL` is set
+3. **Built-in scraper** (default) — uses apibay.org (Pirate Bay JSON API) with TorrentGalaxy as fallback. No config required.
+
+The built-in scraper is enough for most movies and shows. If your ISP blocks torrent sites at the DNS/network level (common in India, UK, and many other countries), you'll see "network may be blocking torrent sites" and should either use a VPN or set up Prowlarr.
+
+## Optional: Prowlarr for more sources
+
+Prowlarr is a free, self-hosted app that connects to dozens of torrent indexers at once. Once running, torflix uses it automatically instead of the built-in scraper.
 
 ### 1. Install Prowlarr
 
@@ -182,6 +194,7 @@ set -gx TORFLIX_JACKETT_APIKEY "your_api_key_here"
 | Key | Action |
 |-----|--------|
 | `Enter` / `l` | Stream selected result |
+| `o` | Cycle sort: seeders → name → size (name-sort groups S01E01/E02/E03 together) |
 | `s` or `/` | New search |
 | `Esc` / `h` | Back to where you came from |
 

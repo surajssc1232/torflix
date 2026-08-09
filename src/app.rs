@@ -52,6 +52,30 @@ pub enum SearchStatus {
     Failed(String),
 }
 
+#[derive(Clone, PartialEq)]
+pub enum SortMode {
+    Seeders, // default: highest seeders first
+    Name,    // alphabetical: groups S01E01, S01E02, S01E03 together
+    Size,    // largest file first
+}
+
+impl SortMode {
+    pub fn next(&self) -> SortMode {
+        match self {
+            SortMode::Seeders => SortMode::Name,
+            SortMode::Name => SortMode::Size,
+            SortMode::Size => SortMode::Seeders,
+        }
+    }
+    pub fn label(&self) -> &'static str {
+        match self {
+            SortMode::Seeders => "seeders",
+            SortMode::Name => "name",
+            SortMode::Size => "size",
+        }
+    }
+}
+
 pub struct App {
     pub client: Client,
     pub view: View,
@@ -75,6 +99,7 @@ pub struct App {
     pub search_query: String,
     pub search: Arc<Mutex<SearchStatus>>,
     pub search_selected: usize,
+    pub search_sort: SortMode,
     pub search_origin: View,   // which view to return to on Esc from SearchResults
 
     // Popular (Letterboxd)
@@ -114,6 +139,7 @@ impl App {
             search_query: String::new(),
             search: Arc::new(Mutex::new(SearchStatus::Idle)),
             search_selected: 0,
+            search_sort: SortMode::Seeders,
             search_origin: View::Torrents,
             popular: Arc::new(Mutex::new(PopularStatus::Idle)),
             popular_selected: 0,
@@ -380,13 +406,11 @@ impl App {
         if q.is_empty() {
             return;
         }
-        let Some(backend) = search::backend_from_env() else {
-            self.status = "✗ no search backend — set TORFLIX_PROWLARR_URL(+_APIKEY) or TORFLIX_JACKETT_URL(+_APIKEY), see README".into();
-            self.view = View::Torrents;
-            return;
-        };
+        // Always Some — falls back to Backend::Builtin (scraper) when unconfigured.
+        let backend = search::backend_from_env().expect("backend_from_env always returns Some");
         *self.search.lock().unwrap() = SearchStatus::Searching;
         self.search_selected = 0;
+        self.search_sort = SortMode::Seeders; // reset to default on new search
         // search_origin is set by the caller (key handler or search_popular_selected)
         self.view = View::SearchResults;
         self.status = format!("searching {} for '{}' …", backend.name(), q);
@@ -407,9 +431,22 @@ impl App {
         }
     }
 
+    pub fn sort_results<'a>(&self, v: &'a [SearchResult]) -> Vec<&'a SearchResult> {
+        let mut refs: Vec<&SearchResult> = v.iter().collect();
+        match self.search_sort {
+            SortMode::Seeders => refs.sort_by(|a, b| b.seeders.cmp(&a.seeders)),
+            SortMode::Name => refs.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase())),
+            SortMode::Size => refs.sort_by(|a, b| b.size.cmp(&a.size)),
+        }
+        refs
+    }
+
     pub fn add_search_selected(&mut self) {
         let picked: Option<SearchResult> = match &*self.search.lock().unwrap() {
-            SearchStatus::Done(v) => v.get(self.search_selected).cloned(),
+            SearchStatus::Done(v) => {
+                let sorted = self.sort_results(v);
+                sorted.get(self.search_selected).map(|r| (*r).clone())
+            }
             _ => None,
         };
         let Some(r) = picked else { return };

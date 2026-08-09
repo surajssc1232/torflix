@@ -192,6 +192,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                             }
                         }
                         KeyCode::Enter | KeyCode::Char('l') => app.add_search_selected(),
+                        KeyCode::Char('o') => {
+                            app.search_sort = app.search_sort.next();
+                            app.search_selected = 0;
+                        }
                         _ => {}
                     },
                     View::Popular => match key.code {

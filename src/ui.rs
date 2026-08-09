@@ -1,4 +1,4 @@
-use crate::app::{human_bytes, is_video, App, PopularStatus, SearchStatus, View};
+use crate::app::{human_bytes, is_video, App, PopularStatus, SearchStatus, SortMode, View};
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -242,7 +242,7 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
         View::Files => " Enter play  p playlist  j/k move  Esc back  q quit",
         View::AddInput => " Enter add  Esc cancel  (paste magnet / URL / .torrent path)",
         View::SearchInput => " Enter search  Esc cancel",
-        View::SearchResults => " Enter stream  s new search  j/k move  Esc back  q quit",
+        View::SearchResults => " Enter stream  o sort (seed/name/size)  s search  j/k move  Esc back  q quit",
         View::ConfirmDelete => " y confirm  n/Esc cancel",
         View::Popular => " s search  Enter stream  Tab/→ list  ]/[ page  r refresh  j/k move  Esc back  q quit",
         View::Torrents => {
@@ -499,7 +499,15 @@ fn draw_search_results(f: &mut Frame, area: Rect, app: &App) {
             f.render_widget(p, area);
         }
         SearchStatus::Done(results) => {
-            let rows: Vec<Row> = results
+            // Apply the user's chosen sort without touching stored data.
+            let mut sorted = results.clone();
+            match app.search_sort {
+                SortMode::Seeders => sorted.sort_by(|a, b| b.seeders.cmp(&a.seeders)),
+                SortMode::Name    => sorted.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase())),
+                SortMode::Size    => sorted.sort_by(|a, b| b.size.cmp(&a.size)),
+            }
+
+            let rows: Vec<Row> = sorted
                 .iter()
                 .map(|r| {
                     let seed_style = if r.seeders >= 20 {
@@ -527,7 +535,11 @@ fn draw_search_results(f: &mut Frame, area: Rect, app: &App) {
                 })
                 .collect();
 
-            let n = results.len();
+            let n = sorted.len();
+            // Mark the active sort column with ▼
+            let hdr_title = if app.search_sort == SortMode::Name    { "title ▼" } else { "title" };
+            let hdr_size  = if app.search_sort == SortMode::Size    { "size ▼"  } else { "size" };
+            let hdr_seed  = if app.search_sort == SortMode::Seeders { "seed ▼"  } else { "seed" };
             let table = Table::new(
                 rows,
                 [
@@ -540,7 +552,7 @@ fn draw_search_results(f: &mut Frame, area: Rect, app: &App) {
                 ],
             )
             .header(
-                Row::new(vec!["title", "size", "seed", "leech", "imdb", "indexer"])
+                Row::new(vec![hdr_title, hdr_size, hdr_seed, "leech", "imdb", "indexer"])
                     .style(Style::default().fg(YELLOW).add_modifier(Modifier::BOLD)),
             )
             .block(block)
