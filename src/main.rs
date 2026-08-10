@@ -125,6 +125,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
             Event::Paste(text) => match app.view {
                 View::AddInput => app.input.push_str(&text),
                 View::Home => app.search_query.push_str(&text),
+                View::SearchResults if app.search_filter_active => {
+                    app.search_filter.push_str(&text);
+                    app.search_selected = 0;
+                }
                 _ => {}
             },
             Event::Key(key) if key.kind == KeyEventKind::Press => {
@@ -168,32 +172,84 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                         KeyCode::Char(c) => app.input.push(c),
                         _ => {}
                     },
-                    View::SearchResults => match key.code {
-                        KeyCode::Esc | KeyCode::Char('h') => {
-                            app.view = View::Home;
-                        }
-                        KeyCode::Char('q') => app.should_quit = true,
-                        KeyCode::Char('s') | KeyCode::Char('/') => {
-                            app.search_query.clear();
-                            app.view = View::Home;
-                        }
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            app.search_selected = app.search_selected.saturating_sub(1);
-                        }
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            let n = app.search_results_len();
-                            if n > 0 {
-                                app.search_selected = (app.search_selected + 1).min(n - 1);
+                    View::SearchResults => {
+                        if app.search_preview.is_some() {
+                            // Preview panel is open — j/k/Enter/d operate on the file list
+                            match key.code {
+                                KeyCode::Up | KeyCode::Char('k') => app.preview_up(),
+                                KeyCode::Down | KeyCode::Char('j') => app.preview_down(),
+                                KeyCode::Enter | KeyCode::Char('l') => app.play_from_preview(),
+                                KeyCode::Char('d') => app.download_from_preview(),
+                                KeyCode::Char('o') => app.preview_cycle_sort(),
+                                KeyCode::Char('f') | KeyCode::Esc | KeyCode::Char('h') => app.close_search_preview(),
+                                KeyCode::Char('q') => app.should_quit = true,
+                                _ => {}
+                            }
+                        } else if app.search_filter_active {
+                            // Filter bar is open — keys type into the filter
+                            match key.code {
+                                KeyCode::Backspace => {
+                                    app.search_filter.pop();
+                                    app.search_selected = 0;
+                                }
+                                KeyCode::Esc => {
+                                    app.search_filter.clear();
+                                    app.search_filter_active = false;
+                                    app.search_selected = 0;
+                                }
+                                KeyCode::Enter => {
+                                    app.search_filter_active = false;
+                                }
+                                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                    app.search_filter.clear();
+                                    app.search_selected = 0;
+                                }
+                                KeyCode::Char('/') => {
+                                    app.search_filter_active = false;
+                                }
+                                KeyCode::Char(c) => {
+                                    app.search_filter.push(c);
+                                    app.search_selected = 0;
+                                }
+                                _ => {}
+                            }
+                        } else {
+                            // Normal navigation
+                            match key.code {
+                                KeyCode::Char('/') => {
+                                    app.search_filter_active = true;
+                                }
+                                KeyCode::Esc | KeyCode::Char('h') => {
+                                    app.view = View::Home;
+                                }
+                                KeyCode::Char('q') => app.should_quit = true,
+                                KeyCode::Char('s') => {
+                                    app.search_query.clear();
+                                    app.view = View::Home;
+                                }
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    app.search_selected = app.search_selected.saturating_sub(1);
+                                }
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    let n = app.search_results_len();
+                                    if n > 0 {
+                                        app.search_selected = (app.search_selected + 1).min(n - 1);
+                                    }
+                                }
+                                KeyCode::Enter | KeyCode::Char('l') => app.add_search_selected(),
+                                KeyCode::Char('d') => app.download_search_selected(),
+                                KeyCode::Char('f') => {
+                                    app.search_filter_active = false;
+                                    app.open_search_preview();
+                                }
+                                KeyCode::Char('o') => {
+                                    app.search_sort = app.search_sort.next();
+                                    app.search_selected = 0;
+                                }
+                                _ => {}
                             }
                         }
-                        KeyCode::Enter | KeyCode::Char('l') => app.add_search_selected(),
-                        KeyCode::Char('d') => app.download_search_selected(),
-                        KeyCode::Char('o') => {
-                            app.search_sort = app.search_sort.next();
-                            app.search_selected = 0;
-                        }
-                        _ => {}
-                    },
+                    }
                     View::ConfirmDelete => match key.code {
                         KeyCode::Char('y') | KeyCode::Char('Y') => app.confirm_delete(),
                         _ => app.view = View::Torrents,

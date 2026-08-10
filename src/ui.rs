@@ -1,4 +1,4 @@
-use crate::app::{human_bytes, is_video, App, SearchStatus, SortMode, View};
+use crate::app::{human_bytes, is_video, App, FileSortMode, PreviewState, SearchPreview, SearchStatus, SortMode, View};
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -309,10 +309,14 @@ fn status_style(status: &str) -> (String, Style) {
 }
 
 fn draw_help(f: &mut Frame, area: Rect, app: &App) {
-    let help = match app.view {
+    let help: &str = match app.view {
         View::Home          => " Enter: search   Tab: downloads   Esc: clear   ?: help",
         View::Files         => " Enter: play   p: playlist   j/k: move   Esc: back   q: quit",
-        View::SearchResults => " Enter: stream   d: download   o: sort   s: new search   j/k   Esc: back",
+        View::SearchResults if app.search_preview.is_some()
+                            => " Enter: stream   d: download   j/k: move   o: sort   f/Esc: close preview",
+        View::SearchResults if app.search_filter_active
+                            => " type: filter   Backspace: delete   Ctrl+U: clear   Esc: clear+close   Enter: keep+close",
+        View::SearchResults => " /: filter   f: files   Enter: stream   d: download   o: sort   s: new search   Esc: back",
         View::ConfirmDelete => " y: confirm   n/Esc: cancel",
         View::Torrents      => " s/Esc: search   a: add   Enter: files   Space: pause   d: remove   q: quit",
         View::AddInput      => " Enter: add   Esc: cancel",
@@ -349,10 +353,12 @@ fn draw_help_popup(f: &mut Frame, area: Rect) {
         row("Tab",         "go to downloads view"),
         Line::from(""),
         section("Search Results"),
+        row("/",           "open filter bar (narrow by title substring)"),
+        row("f",           "preview file list"),
         row("Enter",       "stream selected result"),
         row("d",           "download permanently"),
         row("o",           "cycle sort: seeders → name → size"),
-        row("s  or  /",    "new search (go back to home)"),
+        row("s",           "new search (go back to home)"),
         row("Esc",         "back to home"),
         Line::from(""),
         section("Files view"),
@@ -444,18 +450,11 @@ fn render_results_table(
     f: &mut Frame,
     area: Rect,
     block: Block,
-    results: &[crate::search::SearchResult],
+    results: &[&crate::search::SearchResult],
     sort: &SortMode,
     selected: usize,
 ) {
-    use crate::search::SearchResult;
-    let mut sorted: Vec<&SearchResult> = results.iter().collect();
-    match sort {
-        SortMode::Seeders => sorted.sort_by(|a, b| b.seeders.cmp(&a.seeders)),
-        SortMode::Name    => sorted.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase())),
-        SortMode::Size    => sorted.sort_by(|a, b| b.size.cmp(&a.size)),
-    }
-    let rows: Vec<Row> = sorted.iter().map(|r| {
+    let rows: Vec<Row> = results.iter().map(|r| {
         let seed_style = if r.seeders >= 20 {
             Style::default().fg(GREEN)
         } else if r.seeders > 0 {
@@ -476,7 +475,7 @@ fn render_results_table(
             ratatui::widgets::Cell::from(r.indexer.clone()).style(Style::default().fg(GRAY)),
         ])
     }).collect();
-    let n = sorted.len();
+    let n = results.len();
     let hdr_title = if *sort == SortMode::Name    { "title ▼" } else { "title" };
     let hdr_size  = if *sort == SortMode::Size    { "size ▼"  } else { "size" };
     let hdr_seed  = if *sort == SortMode::Seeders { "seed ▼"  } else { "seed" };
@@ -503,13 +502,43 @@ fn render_results_table(
     f.render_stateful_widget(table, area, &mut state);
 }
 
+fn results_title(q: &str, filtered: usize, total: usize, suffix: &str, filter: &str) -> String {
+    if !filter.is_empty() {
+        format!(" results — '{}' | filter: '{}' ({}/{}{}) ", q, filter, filtered, total, suffix)
+    } else {
+        format!(" results — '{}' ({}{}) ", q, total, suffix)
+    }
+}
+
 fn draw_search_results(f: &mut Frame, area: Rect, app: &App) {
+    let filter_visible = app.search_filter_active || !app.search_filter.is_empty();
+    let filter_h = if filter_visible { 3u16 } else { 0 };
+    let preview_h = if app.search_preview.is_some() { 14u16.min(area.height * 37 / 100) } else { 0 };
+
+    // Build layout constraints dynamically
+    let mut constraints = vec![];
+    if filter_visible { constraints.push(Constraint::Length(filter_h)); }
+    constraints.push(Constraint::Min(3));
+    if app.search_preview.is_some() { constraints.push(Constraint::Length(preview_h)); }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area);
+
+    let mut idx = 0usize;
+    let filter_area = if filter_visible { let a = Some(chunks[idx]); idx += 1; a } else { None };
+    let results_area = chunks[idx]; idx += 1;
+    let preview_area = if app.search_preview.is_some() { Some(chunks[idx]) } else { None };
+
     let q = app.search_query.trim();
+    let filter = &app.search_filter;
+
     let status = app.search.lock().unwrap();
     match &*status {
         SearchStatus::Searching(partial) => {
-            let results = partial.lock().unwrap();
-            if results.is_empty() {
+            let raw = partial.lock().unwrap();
+            if raw.is_empty() {
                 let block = Block::default()
                     .borders(Borders::ALL)
                     .title(format!(" results — '{}' ", q))
@@ -523,13 +552,15 @@ fn draw_search_results(f: &mut Frame, area: Rect, app: &App) {
                 ])
                 .alignment(Alignment::Center)
                 .block(block);
-                f.render_widget(p, area);
+                f.render_widget(p, results_area);
             } else {
+                let filtered = app.filtered_results(&raw);
+                let title = results_title(q, filtered.len(), raw.len(), ", searching…", filter);
                 let block = Block::default()
                     .borders(Borders::ALL)
-                    .title(format!(" results — '{}' ({} found, searching…) ", q, results.len()))
+                    .title(title)
                     .border_style(Style::default().fg(YELLOW));
-                render_results_table(f, area, block, &results, &app.search_sort, app.search_selected);
+                render_results_table(f, results_area, block, &filtered, &app.search_sort, app.search_selected);
             }
         }
         SearchStatus::Failed(e) => {
@@ -545,9 +576,9 @@ fn draw_search_results(f: &mut Frame, area: Rect, app: &App) {
             ])
             .alignment(Alignment::Center)
             .block(block);
-            f.render_widget(p, area);
+            f.render_widget(p, results_area);
         }
-        SearchStatus::Done(results) if results.is_empty() => {
+        SearchStatus::Done(raw) if raw.is_empty() => {
             let block = Block::default()
                 .borders(Borders::ALL)
                 .title(format!(" results — '{}' ", q))
@@ -558,21 +589,151 @@ fn draw_search_results(f: &mut Frame, area: Rect, app: &App) {
             ])
             .alignment(Alignment::Center)
             .block(block);
-            f.render_widget(p, area);
+            f.render_widget(p, results_area);
         }
-        SearchStatus::Done(results) => {
+        SearchStatus::Done(raw) => {
+            let filtered = app.filtered_results(raw);
+            let title = results_title(q, filtered.len(), raw.len(), "", filter);
             let block = Block::default()
                 .borders(Borders::ALL)
-                .title(format!(" results — '{}' ", q))
+                .title(title)
                 .border_style(Style::default().fg(GRAY));
-            render_results_table(f, area, block, results, &app.search_sort, app.search_selected);
+            render_results_table(f, results_area, block, &filtered, &app.search_sort, app.search_selected);
         }
         SearchStatus::Idle => {
             let block = Block::default()
                 .borders(Borders::ALL)
                 .title(format!(" results — '{}' ", q))
                 .border_style(Style::default().fg(GRAY));
-            f.render_widget(block, area);
+            f.render_widget(block, results_area);
+        }
+    }
+    drop(status);
+
+    if let Some(fa) = filter_area {
+        draw_filter_bar(f, fa, app);
+    }
+    if let (Some(pa), Some(preview)) = (preview_area, &app.search_preview) {
+        draw_preview_panel(f, pa, preview);
+    }
+}
+
+fn draw_filter_bar(f: &mut Frame, area: Rect, app: &App) {
+    let active = app.search_filter_active;
+    let border_color = if active { AQUA } else { GRAY };
+    let title = if active {
+        " filter — Esc: clear+close   Enter or /: keep+close "
+    } else {
+        " filter — /: edit   Esc: clear "
+    };
+
+    let content = if app.search_filter.is_empty() {
+        Line::from(vec![
+            Span::styled("  › ", Style::default().fg(AQUA)),
+            Span::styled("type to narrow results…", Style::default().fg(GRAY)),
+        ])
+    } else if active {
+        Line::from(vec![
+            Span::styled("  › ", Style::default().fg(AQUA).add_modifier(Modifier::BOLD)),
+            Span::styled(app.search_filter.clone(), Style::default().fg(FG)),
+            Span::styled("█", Style::default().fg(AQUA)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("  › ", Style::default().fg(GRAY)),
+            Span::styled(app.search_filter.clone(), Style::default().fg(YELLOW)),
+            Span::styled("  (/ to edit)", Style::default().fg(GRAY)),
+        ])
+    };
+
+    let p = Paragraph::new(vec![content]).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .border_style(Style::default().fg(border_color)),
+    );
+    f.render_widget(p, area);
+}
+
+fn draw_preview_panel(f: &mut Frame, area: Rect, preview: &SearchPreview) {
+    let state = preview.state.lock().unwrap();
+    match &*state {
+        PreviewState::Loading => {
+            let p = Paragraph::new(vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "⧗ fetching file list from peers…",
+                    Style::default().fg(YELLOW),
+                )),
+            ])
+            .alignment(Alignment::Center)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" files ")
+                    .border_style(Style::default().fg(AQUA)),
+            );
+            f.render_widget(p, area);
+        }
+        PreviewState::Error(e) => {
+            let p = Paragraph::new(vec![
+                Line::from(""),
+                Line::from(Span::styled(format!("✗ {}", e), Style::default().fg(RED))),
+            ])
+            .alignment(Alignment::Center)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" files ")
+                    .border_style(Style::default().fg(RED)),
+            );
+            f.render_widget(p, area);
+        }
+        PreviewState::Ready(files) => {
+            let mut sorted: Vec<&crate::rqbit::FileDetails> = files.iter().collect();
+            match preview.file_sort {
+                FileSortMode::Name => sorted.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+                FileSortMode::Size => sorted.sort_by(|a, b| b.length.cmp(&a.length)),
+            }
+            let sort_label = match preview.file_sort {
+                FileSortMode::Name => "name ▼",
+                FileSortMode::Size => "size ▼",
+            };
+
+            let items: Vec<ListItem> = sorted
+                .iter()
+                .map(|file| {
+                    let video = is_video(&file.name);
+                    let icon = if video { "▶ " } else { "  " };
+                    let style = if video { Style::default().fg(FG) } else { Style::default().fg(GRAY) };
+                    ListItem::new(Line::from(vec![
+                        Span::styled(icon, Style::default().fg(ORANGE)),
+                        Span::styled(file.name.clone(), style),
+                        Span::styled(
+                            format!("  ({})", human_bytes(file.length)),
+                            Style::default().fg(GRAY),
+                        ),
+                    ]))
+                })
+                .collect();
+
+            let list = List::new(items)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(format!(" files ({}) [{}] — o: sort   Enter: stream   d: download   f/Esc: close ", files.len(), sort_label))
+                        .border_style(Style::default().fg(AQUA)),
+                )
+                .highlight_style(
+                    Style::default()
+                        .bg(Color::Rgb(0x3c, 0x38, 0x36))
+                        .add_modifier(Modifier::BOLD),
+                )
+                .highlight_symbol("→ ");
+
+            let mut list_state = ListState::default();
+            list_state.select(Some(preview.file_selected.min(files.len().saturating_sub(1))));
+            f.render_stateful_widget(list, area, &mut list_state);
         }
     }
 }

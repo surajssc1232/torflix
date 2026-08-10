@@ -89,6 +89,28 @@ impl SortMode {
     }
 }
 
+pub enum PreviewState {
+    Loading,
+    Ready(Vec<crate::rqbit::FileDetails>),
+    Error(String),
+}
+
+#[derive(Clone, PartialEq)]
+pub enum FileSortMode {
+    Name,
+    Size,
+}
+
+pub struct SearchPreview {
+    pub result_idx: usize,
+    pub file_selected: usize,
+    pub file_sort: FileSortMode,
+    pub state: Arc<Mutex<PreviewState>>,
+    pub torrent_id: Arc<Mutex<Option<u64>>>,
+    pub temp_dir: std::path::PathBuf,
+    pub cancelled: Arc<Mutex<bool>>,
+}
+
 pub struct App {
     pub client: Client,
     pub view: View,
@@ -113,6 +135,9 @@ pub struct App {
     pub search: Arc<Mutex<SearchStatus>>,
     pub search_selected: usize,
     pub search_sort: SortMode,
+    pub search_filter: String,
+    pub search_filter_active: bool,
+    pub search_preview: Option<SearchPreview>,
 
     // Ratings cache (IMDb + RT via OMDb, keyed by "title|year")
     pub ratings: Arc<Mutex<HashMap<String, omdb::Ratings>>>,
@@ -147,6 +172,9 @@ impl App {
             search: Arc::new(Mutex::new(SearchStatus::Idle)),
             search_selected: 0,
             search_sort: SortMode::Seeders,
+            search_filter: String::new(),
+            search_filter_active: false,
+            search_preview: None,
             ratings: Arc::new(Mutex::new(HashMap::new())),
             ratings_fetching: Arc::new(Mutex::new(None)),
             status_tx,
@@ -341,11 +369,11 @@ impl App {
                     std::fs::remove_dir_all(&temp_dir).ok();
                     return;
                 }
-                thread::sleep(Duration::from_millis(1000));
                 match client.details(id) {
                     Ok(d) if !d.files.is_empty() => break d,
                     _ => {}
                 }
+                thread::sleep(Duration::from_millis(250));
             };
 
             let best = details
@@ -414,6 +442,8 @@ impl App {
         *self.search.lock().unwrap() = SearchStatus::Searching(Arc::clone(&partial));
         self.search_selected = 0;
         self.search_sort = SortMode::Seeders;
+        self.search_filter.clear();
+        self.search_filter_active = false;
         self.view = View::SearchResults;
         self.status = format!("searching {} for '{}' …", backend.name(), q);
         let state = Arc::clone(&self.search);
@@ -428,8 +458,11 @@ impl App {
 
     pub fn search_results_len(&self) -> usize {
         match &*self.search.lock().unwrap() {
-            SearchStatus::Done(v) => v.len(),
-            SearchStatus::Searching(partial) => partial.lock().unwrap().len(),
+            SearchStatus::Done(v) => self.filtered_results(v).len(),
+            SearchStatus::Searching(partial) => {
+                let v = partial.lock().unwrap();
+                self.filtered_results(&v).len()
+            }
             _ => 0,
         }
     }
@@ -444,16 +477,25 @@ impl App {
         refs
     }
 
+    pub fn filtered_results<'a>(&self, v: &'a [SearchResult]) -> Vec<&'a SearchResult> {
+        let sorted = self.sort_results(v);
+        if self.search_filter.is_empty() {
+            return sorted;
+        }
+        let needle = self.search_filter.to_lowercase();
+        sorted.into_iter().filter(|r| r.title.to_lowercase().contains(&needle)).collect()
+    }
+
     pub fn download_search_selected(&mut self) {
         let picked: Option<SearchResult> = match &*self.search.lock().unwrap() {
             SearchStatus::Done(v) => {
-                let sorted = self.sort_results(v);
-                sorted.get(self.search_selected).map(|r| (*r).clone())
+                let filtered = self.filtered_results(v);
+                filtered.get(self.search_selected).map(|r| (*r).clone())
             }
             SearchStatus::Searching(partial) => {
                 let v = partial.lock().unwrap();
-                let sorted = self.sort_results(&v);
-                sorted.get(self.search_selected).map(|r| (*r).clone())
+                let filtered = self.filtered_results(&v);
+                filtered.get(self.search_selected).map(|r| (*r).clone())
             }
             _ => None,
         };
@@ -490,13 +532,13 @@ impl App {
     pub fn add_search_selected(&mut self) {
         let picked: Option<SearchResult> = match &*self.search.lock().unwrap() {
             SearchStatus::Done(v) => {
-                let sorted = self.sort_results(v);
-                sorted.get(self.search_selected).map(|r| (*r).clone())
+                let filtered = self.filtered_results(v);
+                filtered.get(self.search_selected).map(|r| (*r).clone())
             }
             SearchStatus::Searching(partial) => {
                 let v = partial.lock().unwrap();
-                let sorted = self.sort_results(&v);
-                sorted.get(self.search_selected).map(|r| (*r).clone())
+                let filtered = self.filtered_results(&v);
+                filtered.get(self.search_selected).map(|r| (*r).clone())
             }
             _ => None,
         };
@@ -507,6 +549,212 @@ impl App {
                 self.add_and_play_async(&target, &r.title);
             }
             None => self.status = "✗ result has no magnet or download link".into(),
+        }
+    }
+
+    pub fn open_search_preview(&mut self) {
+        self.close_search_preview();
+
+        let target = match &*self.search.lock().unwrap() {
+            SearchStatus::Done(v) => {
+                let filtered = self.filtered_results(v);
+                filtered.get(self.search_selected).and_then(|r| r.add_target()).map(str::to_string)
+            }
+            SearchStatus::Searching(partial) => {
+                let v = partial.lock().unwrap();
+                let filtered = self.filtered_results(&v);
+                filtered.get(self.search_selected).and_then(|r| r.add_target()).map(str::to_string)
+            }
+            _ => None,
+        };
+        let Some(target) = target else { return };
+
+        let state: Arc<Mutex<PreviewState>> = Arc::new(Mutex::new(PreviewState::Loading));
+        let torrent_id: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+        let cancelled: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "torflix-preview-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&temp_dir).ok();
+
+        self.search_preview = Some(SearchPreview {
+            result_idx: self.search_selected,
+            file_selected: 0,
+            file_sort: FileSortMode::Name,
+            state: Arc::clone(&state),
+            torrent_id: Arc::clone(&torrent_id),
+            temp_dir: temp_dir.clone(),
+            cancelled: Arc::clone(&cancelled),
+        });
+        self.status = "⧗ fetching file list…".into();
+
+        let client = self.client.clone();
+        let tx = self.status_tx.clone();
+        thread::spawn(move || {
+            let id = match client.add_to_dir(&target, &temp_dir) {
+                Ok(id) => id,
+                Err(e) => {
+                    *state.lock().unwrap() = PreviewState::Error(e.to_string());
+                    std::fs::remove_dir_all(&temp_dir).ok();
+                    return;
+                }
+            };
+            *torrent_id.lock().unwrap() = Some(id);
+
+            if *cancelled.lock().unwrap() {
+                client.forget(id).ok();
+                std::fs::remove_dir_all(&temp_dir).ok();
+                return;
+            }
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                if *cancelled.lock().unwrap() {
+                    client.forget(id).ok();
+                    std::fs::remove_dir_all(&temp_dir).ok();
+                    return;
+                }
+                if std::time::Instant::now() > deadline {
+                    *state.lock().unwrap() = PreviewState::Error("metadata timeout".into());
+                    client.forget(id).ok();
+                    std::fs::remove_dir_all(&temp_dir).ok();
+                    let _ = tx.send("✗ file list: metadata timeout".into());
+                    return;
+                }
+                match client.details(id) {
+                    Ok(d) if !d.files.is_empty() => {
+                        let _ = tx.send(format!("✓ {} files", d.files.len()));
+                        *state.lock().unwrap() = PreviewState::Ready(d.files);
+                        return;
+                    }
+                    _ => {}
+                }
+                thread::sleep(Duration::from_millis(250));
+            }
+        });
+    }
+
+    pub fn close_search_preview(&mut self) {
+        if let Some(preview) = self.search_preview.take() {
+            *preview.cancelled.lock().unwrap() = true;
+            if let Some(id) = *preview.torrent_id.lock().unwrap() {
+                self.client.forget(id).ok();
+            }
+            std::fs::remove_dir_all(&preview.temp_dir).ok();
+        }
+    }
+
+    pub fn preview_up(&mut self) {
+        if let Some(p) = &mut self.search_preview {
+            p.file_selected = p.file_selected.saturating_sub(1);
+        }
+    }
+
+    pub fn preview_down(&mut self) {
+        if let Some(p) = &mut self.search_preview {
+            let len = match &*p.state.lock().unwrap() {
+                PreviewState::Ready(files) => files.len(),
+                _ => 0,
+            };
+            if len > 0 {
+                p.file_selected = (p.file_selected + 1).min(len - 1);
+            }
+        }
+    }
+
+    pub fn preview_cycle_sort(&mut self) {
+        if let Some(p) = &mut self.search_preview {
+            p.file_sort = match p.file_sort {
+                FileSortMode::Name => FileSortMode::Size,
+                FileSortMode::Size => FileSortMode::Name,
+            };
+            p.file_selected = 0;
+        }
+    }
+
+    pub fn play_from_preview(&mut self) {
+        let data = {
+            let Some(preview) = &self.search_preview else { return };
+            let id = match *preview.torrent_id.lock().unwrap() {
+                Some(id) => id,
+                None => return,
+            };
+            let (idx, name) = match &*preview.state.lock().unwrap() {
+                PreviewState::Ready(files) => match files.get(preview.file_selected) {
+                    Some(f) => (preview.file_selected, f.name.clone()),
+                    None => return,
+                },
+                _ => return,
+            };
+            (id, idx, name)
+        };
+        let (id, file_idx, file_name) = data;
+
+        // Promote the preview to a live stream — take ownership so cleanup doesn't double-forget
+        let preview = self.search_preview.take().unwrap();
+        let temp_dir = preview.temp_dir.clone();
+        // Mark cancelled so the background loader thread won't touch it if still running
+        *preview.cancelled.lock().unwrap() = true;
+
+        let Some(player_cmd) = find_player() else {
+            self.status = "✗ no player found — install mpv or vlc".into();
+            self.client.forget(id).ok();
+            std::fs::remove_dir_all(&temp_dir).ok();
+            return;
+        };
+
+        let url = self.client.stream_url(id, file_idx);
+        let client = self.client.clone();
+        let tx = self.status_tx.clone();
+        let title = file_name.clone();
+
+        match spawn_player(&player_cmd, &url, &title) {
+            Ok(mut child) => {
+                self.status = format!("▶ streaming: {}", title);
+                thread::spawn(move || {
+                    child.wait().ok();
+                    client.forget(id).ok();
+                    std::fs::remove_dir_all(&temp_dir).ok();
+                    let _ = tx.send(format!("✓ done: {} — temp files deleted", title));
+                });
+            }
+            Err(e) => {
+                self.status = format!("✗ couldn't launch player: {}", e);
+                self.client.forget(id).ok();
+                std::fs::remove_dir_all(&temp_dir).ok();
+            }
+        }
+    }
+
+    pub fn download_from_preview(&mut self) {
+        // Get the original result by index so we can re-add to the permanent download dir
+        let result = {
+            match &*self.search.lock().unwrap() {
+                SearchStatus::Done(v) => {
+                    let filtered = self.filtered_results(v);
+                    let idx = self.search_preview.as_ref().map(|p| p.result_idx).unwrap_or(self.search_selected);
+                    filtered.get(idx).map(|r| (*r).clone())
+                }
+                SearchStatus::Searching(partial) => {
+                    let v = partial.lock().unwrap();
+                    let filtered = self.filtered_results(&v);
+                    let idx = self.search_preview.as_ref().map(|p| p.result_idx).unwrap_or(self.search_selected);
+                    filtered.get(idx).map(|r| (*r).clone())
+                }
+                _ => None,
+            }
+        };
+        self.close_search_preview(); // forget temp torrent
+        if let Some(r) = result {
+            if let Some(target) = r.add_target() {
+                let target = target.to_string();
+                self.download_to_disk_async(&target, &r.title);
+            }
         }
     }
 
