@@ -91,7 +91,8 @@ impl SortMode {
 
 pub enum PreviewState {
     Loading,
-    Ready(Vec<crate::rqbit::FileDetails>),
+    // (original_rqbit_index, file) — original index is needed for the stream URL
+    Ready(Vec<(usize, crate::rqbit::FileDetails)>),
     Error(String),
 }
 
@@ -120,6 +121,7 @@ pub struct App {
 
     // Files view
     pub files: Vec<FileDetails>,
+    pub files_stream_indices: Vec<usize>, // original rqbit indices (files are sorted by name for display)
     pub files_torrent_id: u64,
     pub files_torrent_name: String,
     pub file_selected: usize,
@@ -163,6 +165,7 @@ impl App {
             engine_up: Arc::new(Mutex::new(true)),
             selected: 0,
             files: Vec::new(),
+            files_stream_indices: Vec::new(),
             files_torrent_id: 0,
             files_torrent_name: String::new(),
             file_selected: 0,
@@ -236,17 +239,19 @@ impl App {
         };
         match self.client.details(row.id) {
             Ok(d) => {
-                self.files = d.files;
+                // Sort files alphabetically so episodes appear in order (E01, E02, …).
+                // Keep the original rqbit index for each file — the stream URL uses that.
+                let mut indexed: Vec<(usize, FileDetails)> = d.files.into_iter().enumerate().collect();
+                indexed.sort_by(|(_, a), (_, b)| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                self.files_stream_indices = indexed.iter().map(|(i, _)| *i).collect();
+                self.files = indexed.into_iter().map(|(_, f)| f).collect();
                 self.files_torrent_id = row.id;
                 self.files_torrent_name = d.name.unwrap_or(row.name);
-                // Preselect the largest video file — almost always the movie.
+                // Default to the first video file in sorted order (E01 for a season pack).
                 self.file_selected = self
                     .files
                     .iter()
-                    .enumerate()
-                    .filter(|(_, f)| is_video(&f.name))
-                    .max_by_key(|(_, f)| f.length)
-                    .map(|(i, _)| i)
+                    .position(|f| is_video(&f.name))
                     .unwrap_or(0);
                 self.view = View::Files;
                 self.status =
@@ -260,9 +265,11 @@ impl App {
         let Some(file) = self.files.get(self.file_selected) else {
             return;
         };
-        let url = self
-            .client
-            .stream_url(self.files_torrent_id, self.file_selected);
+        let stream_idx = self.files_stream_indices
+            .get(self.file_selected)
+            .copied()
+            .unwrap_or(self.file_selected);
+        let url = self.client.stream_url(self.files_torrent_id, stream_idx);
         let title = file.name.clone();
         self.launch_player(&url, &title);
     }
@@ -629,7 +636,8 @@ impl App {
                 match client.details(id) {
                     Ok(d) if !d.files.is_empty() => {
                         let _ = tx.send(format!("✓ {} files", d.files.len()));
-                        *state.lock().unwrap() = PreviewState::Ready(d.files);
+                        let indexed = d.files.into_iter().enumerate().collect();
+                        *state.lock().unwrap() = PreviewState::Ready(indexed);
                         return;
                     }
                     _ => {}
@@ -667,6 +675,20 @@ impl App {
         }
     }
 
+    /// Sort files the same way draw_preview_panel does, so play_from_preview
+    /// picks the right original rqbit index for the visually selected row.
+    fn preview_sorted_files<'a>(
+        files: &'a [(usize, FileDetails)],
+        sort: &FileSortMode,
+    ) -> Vec<&'a (usize, FileDetails)> {
+        let mut v: Vec<&(usize, FileDetails)> = files.iter().collect();
+        match sort {
+            FileSortMode::Name => v.sort_by(|a, b| a.1.name.to_lowercase().cmp(&b.1.name.to_lowercase())),
+            FileSortMode::Size => v.sort_by(|a, b| b.1.length.cmp(&a.1.length)),
+        }
+        v
+    }
+
     pub fn preview_cycle_sort(&mut self) {
         if let Some(p) = &mut self.search_preview {
             p.file_sort = match p.file_sort {
@@ -685,10 +707,15 @@ impl App {
                 None => return,
             };
             let (idx, name) = match &*preview.state.lock().unwrap() {
-                PreviewState::Ready(files) => match files.get(preview.file_selected) {
-                    Some(f) => (preview.file_selected, f.name.clone()),
-                    None => return,
-                },
+                PreviewState::Ready(files) => {
+                    // Sort the same way the UI displays them so file_selected
+                    // maps to the correct visual row and original rqbit index.
+                    let sorted = Self::preview_sorted_files(files, &preview.file_sort);
+                    match sorted.get(preview.file_selected) {
+                        Some((orig_idx, f)) => (*orig_idx, f.name.clone()),
+                        None => return,
+                    }
+                }
                 _ => return,
             };
             (id, idx, name)

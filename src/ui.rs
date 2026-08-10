@@ -690,10 +690,11 @@ fn draw_preview_panel(f: &mut Frame, area: Rect, preview: &SearchPreview) {
             f.render_widget(p, area);
         }
         PreviewState::Ready(files) => {
-            let mut sorted: Vec<&crate::rqbit::FileDetails> = files.iter().collect();
+            // Sort the same way play_from_preview does so visual position == file_selected.
+            let mut sorted: Vec<&(usize, crate::rqbit::FileDetails)> = files.iter().collect();
             match preview.file_sort {
-                FileSortMode::Name => sorted.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
-                FileSortMode::Size => sorted.sort_by(|a, b| b.length.cmp(&a.length)),
+                FileSortMode::Name => sorted.sort_by(|a, b| a.1.name.to_lowercase().cmp(&b.1.name.to_lowercase())),
+                FileSortMode::Size => sorted.sort_by(|a, b| b.1.length.cmp(&a.1.length)),
             }
             let sort_label = match preview.file_sort {
                 FileSortMode::Name => "name ▼",
@@ -702,7 +703,7 @@ fn draw_preview_panel(f: &mut Frame, area: Rect, preview: &SearchPreview) {
 
             let items: Vec<ListItem> = sorted
                 .iter()
-                .map(|file| {
+                .map(|(_, file)| {
                     let video = is_video(&file.name);
                     let icon = if video { "▶ " } else { "  " };
                     let style = if video { Style::default().fg(FG) } else { Style::default().fg(GRAY) };
