@@ -41,6 +41,23 @@ fn download_dir() -> PathBuf {
 }
 
 fn main() -> Result<()> {
+    // Parse CLI flags before anything else so download_dir() picks up -d.
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    let mut positional: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < raw_args.len() {
+        if raw_args[i] == "-d" {
+            i += 1;
+            match raw_args.get(i) {
+                Some(path) => std::env::set_var("TORFLIX_DOWNLOAD_DIR", path),
+                None => anyhow::bail!("'-d' requires a path argument"),
+            }
+        } else if !raw_args[i].starts_with('-') {
+            positional.push(raw_args[i].clone());
+        }
+        i += 1;
+    }
+
     let api_url =
         std::env::var("TORFLIX_RQBIT_URL").unwrap_or_else(|_| rqbit::DEFAULT_API.to_string());
     let client = Client::new(&api_url);
@@ -71,11 +88,8 @@ fn main() -> Result<()> {
     let mut app = App::new(client);
     app.spawn_poller();
 
-    // Add anything passed on the command line (magnet, URL, or .torrent path).
-    for arg in std::env::args().skip(1) {
-        if arg.starts_with('-') {
-            continue;
-        }
+    // Add magnet/URL/.torrent paths passed on the command line.
+    for arg in positional {
         let label = arg.clone();
         app.add_and_play_async(&arg, &label);
     }

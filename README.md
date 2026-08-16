@@ -77,6 +77,13 @@ torflix "magnet:?xt=urn:btih:..."
 torflix ~/Downloads/movie.torrent
 ```
 
+Override the download directory for this session with `-d`:
+
+```bash
+torflix -d ~/Videos/torrents
+torflix -d /mnt/nas/movies "magnet:?xt=urn:btih:..."
+```
+
 ## Key bindings
 
 ### Home screen
@@ -192,7 +199,7 @@ set -gx TORFLIX_PROWLARR_APIKEY "your_api_key_here"
 | `TORFLIX_JACKETT_APIKEY` | — | Jackett API key |
 | `TORFLIX_OMDB_KEY` | — | [OMDb API key](https://www.omdbapi.com/apikey.aspx) for IMDb + RT ratings |
 | `TORFLIX_PLAYER` | auto | Player override (e.g. `mpv --fullscreen`) |
-| `TORFLIX_DOWNLOAD_DIR` | `~/Downloads/torflix` | Permanent download directory |
+| `TORFLIX_DOWNLOAD_DIR` | `~/Downloads/torflix` | Permanent download directory (also settable per-session with `-d <path>`) |
 | `TORFLIX_RQBIT_URL` | `http://127.0.0.1:3030` | rqbit API URL (if running externally) |
 
 ## Ratings (optional)

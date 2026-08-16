@@ -894,24 +894,54 @@ pub fn find_player() -> Option<String> {
 
 fn player_candidates() -> Vec<String> {
     let mut v: Vec<String> = vec!["mpv".into(), "vlc".into()];
-    // On Windows, VLC and mpv are rarely in PATH — check default install locations.
+    // On Windows, VLC and mpv are rarely in PATH — check registry then fallback paths.
     #[cfg(target_os = "windows")]
     {
-        let prog_files: Vec<String> = ["PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432"]
-            .iter()
-            .filter_map(|var| std::env::var(var).ok())
-            .collect();
-        for pf in &prog_files {
-            v.push(format!(r"{}\VideoLAN\VLC\vlc.exe", pf));
+        // Registry is the most reliable source: VLC always writes its path there.
+        if let Some(path) = vlc_from_registry() {
+            v.push(path);
         }
-        // mpv portable is commonly placed in %APPDATA%\mpv or %LOCALAPPDATA%\mpv
-        for var in &["APPDATA", "LOCALAPPDATA"] {
+        // Fallback: common default install locations.
+        for var in &["PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432"] {
+            if let Ok(pf) = std::env::var(var) {
+                v.push(format!(r"{}\VideoLAN\VLC\vlc.exe", pf));
+            }
+        }
+        // mpv portable is commonly placed in %LOCALAPPDATA%\mpv or %APPDATA%\mpv.
+        for var in &["LOCALAPPDATA", "APPDATA"] {
             if let Ok(base) = std::env::var(var) {
                 v.push(format!(r"{}\mpv\mpv.exe", base));
             }
         }
     }
     v
+}
+
+/// Query the Windows registry for VLC's install path.
+/// VLC writes `HKLM\SOFTWARE\VideoLAN\VLC` (default value) = path to vlc.exe.
+#[cfg(target_os = "windows")]
+fn vlc_from_registry() -> Option<String> {
+    for key in &[
+        r"HKLM\SOFTWARE\VideoLAN\VLC",
+        r"HKLM\SOFTWARE\WOW6432Node\VideoLAN\VLC",
+    ] {
+        let out = Command::new("reg")
+            .args(["query", key, "/ve"])
+            .output()
+            .ok()?;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        for line in stdout.lines() {
+            if line.contains("REG_SZ") {
+                if let Some(path) = line.splitn(3, "REG_SZ").nth(1) {
+                    let path = path.trim().to_string();
+                    if !path.is_empty() {
+                        return Some(path);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Spawns the media player with an appropriate title flag.
