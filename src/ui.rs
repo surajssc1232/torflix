@@ -101,10 +101,22 @@ fn draw_home(f: &mut Frame, area: Rect, app: &App) {
         ])
         .split(area);
 
-    // ASCII art lines
+    // ASCII art — wave animation: one row glows ORANGE, rest stay YELLOW.
+    // Sweeps down every 2 ticks (≈500 ms), then pauses at bottom before repeating.
+    let n_rows = ASCII_ART.len() as u64;
+    let period = n_rows + 3; // extra ticks of "pause" after the last row
+    let wave_row = (app.tick / 2) % period;
     let art_lines: Vec<Line> = ASCII_ART
         .iter()
-        .map(|l| Line::from(Span::styled(*l, Style::default().fg(YELLOW).add_modifier(Modifier::BOLD))))
+        .enumerate()
+        .map(|(i, l)| {
+            let color = if wave_row < n_rows && i as u64 == wave_row {
+                ORANGE
+            } else {
+                YELLOW
+            };
+            Line::from(Span::styled(*l, Style::default().fg(color).add_modifier(Modifier::BOLD)))
+        })
         .collect();
     f.render_widget(
         Paragraph::new(art_lines).alignment(Alignment::Center),
@@ -162,15 +174,18 @@ fn draw_home(f: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-fn progress_bar(pct: f64, width: usize) -> String {
+fn progress_bar_spans(pct: f64, width: usize) -> Line<'static> {
     let filled = ((pct / 100.0) * width as f64).round() as usize;
     let filled = filled.min(width);
-    format!(
-        "{}{} {:>5.1}%",
-        "█".repeat(filled),
-        "░".repeat(width - filled),
-        pct
-    )
+    let bar_color = if pct >= 100.0 { AQUA } else { GREEN };
+    Line::from(vec![
+        Span::styled("█".repeat(filled), Style::default().fg(bar_color)),
+        Span::styled("░".repeat(width - filled), Style::default().fg(GRAY)),
+        Span::styled(
+            format!(" {:>5.1}%", pct),
+            Style::default().fg(YELLOW).add_modifier(Modifier::BOLD),
+        ),
+    ])
 }
 
 fn draw_torrents(f: &mut Frame, area: Rect, app: &App) {
@@ -214,8 +229,7 @@ fn draw_torrents(f: &mut Frame, area: Rect, app: &App) {
             };
             Row::new(vec![
                 ratatui::widgets::Cell::from(t.name.clone()),
-                ratatui::widgets::Cell::from(progress_bar(pct, 20))
-                    .style(Style::default().fg(if pct >= 100.0 { AQUA } else { GREEN })),
+                ratatui::widgets::Cell::from(progress_bar_spans(pct, 14)),
                 ratatui::widgets::Cell::from(speed),
                 ratatui::widgets::Cell::from(peers),
                 ratatui::widgets::Cell::from(eta),
@@ -228,7 +242,7 @@ fn draw_torrents(f: &mut Frame, area: Rect, app: &App) {
         rows,
         [
             Constraint::Min(24),
-            Constraint::Length(28),
+            Constraint::Length(22), // 14 bar + space + 6 for " xx.x%"
             Constraint::Length(12),
             Constraint::Length(6),
             Constraint::Length(12),

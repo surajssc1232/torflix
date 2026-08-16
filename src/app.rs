@@ -153,6 +153,7 @@ pub struct App {
     pub should_quit: bool,
     pub stop_engine_on_quit: bool,
     pub show_help: bool,
+    pub tick: u64,
 }
 
 impl App {
@@ -186,6 +187,7 @@ impl App {
             should_quit: false,
             stop_engine_on_quit: false,
             show_help: !help_seen(),
+            tick: 0,
         }
     }
 

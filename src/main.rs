@@ -130,6 +130,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
             app.maybe_fetch_search_ratings();
         }
 
+        app.tick = app.tick.wrapping_add(1);
         terminal.draw(|f| ui::draw(f, app))?;
 
         if !event::poll(Duration::from_millis(250))? {
