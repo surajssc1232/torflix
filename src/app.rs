@@ -877,7 +877,8 @@ pub fn find_player() -> Option<String> {
             return Some(p);
         }
     }
-    for candidate in &["mpv", "vlc"] {
+    let candidates = player_candidates();
+    for candidate in &candidates {
         if Command::new(candidate)
             .arg("--version")
             .stdout(Stdio::null())
@@ -891,6 +892,28 @@ pub fn find_player() -> Option<String> {
     None
 }
 
+fn player_candidates() -> Vec<String> {
+    let mut v: Vec<String> = vec!["mpv".into(), "vlc".into()];
+    // On Windows, VLC and mpv are rarely in PATH — check default install locations.
+    #[cfg(target_os = "windows")]
+    {
+        let prog_files: Vec<String> = ["PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432"]
+            .iter()
+            .filter_map(|var| std::env::var(var).ok())
+            .collect();
+        for pf in &prog_files {
+            v.push(format!(r"{}\VideoLAN\VLC\vlc.exe", pf));
+        }
+        // mpv portable is commonly placed in %APPDATA%\mpv or %LOCALAPPDATA%\mpv
+        for var in &["APPDATA", "LOCALAPPDATA"] {
+            if let Ok(base) = std::env::var(var) {
+                v.push(format!(r"{}\mpv\mpv.exe", base));
+            }
+        }
+    }
+    v
+}
+
 /// Spawns the media player with an appropriate title flag.
 fn spawn_player(player_cmd: &str, url: &str, title: &str) -> std::io::Result<std::process::Child> {
     let mut parts = player_cmd.split_whitespace();
@@ -899,14 +922,11 @@ fn spawn_player(player_cmd: &str, url: &str, title: &str) -> std::io::Result<std
 
     let mut cmd = Command::new(bin);
     cmd.args(&extra);
-    match bin {
-        "mpv" => {
-            cmd.arg(format!("--force-media-title={}", title));
-        }
-        "vlc" => {
-            cmd.args(["--meta-title", title]);
-        }
-        _ => {}
+    let bin_lc = bin.to_lowercase();
+    if bin_lc.contains("mpv") {
+        cmd.arg(format!("--force-media-title={}", title));
+    } else if bin_lc.contains("vlc") {
+        cmd.args(["--meta-title", title]);
     }
     cmd.arg(url)
         .stdin(Stdio::null())

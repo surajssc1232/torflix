@@ -56,6 +56,12 @@ torflix embeds [rqbit](https://github.com/ikatson/rqbit) directly — no daemon 
 
 Without a player, torrents are downloaded permanently to disk instead.
 
+On **Windows**, VLC and mpv are often not in `PATH`. torflix checks the default install locations automatically (`%PROGRAMFILES%\VideoLAN\VLC\vlc.exe` etc). If detection still fails, set `TORFLIX_PLAYER` to the full path:
+
+```powershell
+$env:TORFLIX_PLAYER = "C:\Program Files\VideoLAN\VLC\vlc.exe"
+```
+
 ## Quick start
 
 ```bash
