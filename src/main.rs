@@ -170,6 +170,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                                 app.view = View::Torrents;
                                 app.status = "a: add magnet/URL  Enter: files  Space: pause  q: quit".into();
                             }
+                            // q quits when the search bar is empty, otherwise types into it
+                            KeyCode::Char('q') if app.search_query.is_empty() => {
+                                app.should_quit = true;
+                            }
                             KeyCode::Char(c) => app.search_query.push(c),
                             _ => {}
                         }

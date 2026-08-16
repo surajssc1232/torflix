@@ -324,7 +324,7 @@ fn status_style(status: &str) -> (String, Style) {
 
 fn draw_help(f: &mut Frame, area: Rect, app: &App) {
     let help: &str = match app.view {
-        View::Home          => " Enter: search   Tab: downloads   Esc: clear   ?: help",
+        View::Home          => " Enter: search   Tab: downloads   Esc: clear   q: quit   ?: help",
         View::Files         => " Enter: play   p: playlist   j/k: move   Esc: back   q: quit",
         View::SearchResults if app.search_preview.is_some()
                             => " Enter: stream   d: download   j/k: move   o: sort   f/Esc: close preview",
