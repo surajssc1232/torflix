@@ -1,6 +1,6 @@
 [package]
 name = "torflix"
-version = "0.4.5"
+version = "0.4.6"
 edition = "2021"
 description = "Stream movies in your terminal from magnet links and torrents — powered by rqbit + mpv/vlc"
 license = "MIT"

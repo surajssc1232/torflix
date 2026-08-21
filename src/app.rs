@@ -879,24 +879,51 @@ pub fn find_player() -> Option<String> {
             return Some(p);
         }
     }
-    let candidates = player_candidates();
-    for candidate in &candidates {
-        if Command::new(candidate)
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok()
-        {
-            return Some(candidate.to_string());
-        }
+    player_candidates().into_iter().find(|c| player_exists(c))
+}
+
+/// True if `candidate` names a runnable player.
+///
+/// On Windows we resolve on disk rather than executing: `vlc.exe --version`
+/// opens a modal dialog there instead of printing and exiting, so probing it
+/// would block startup until a human dismissed the window.
+#[cfg(target_os = "windows")]
+fn player_exists(candidate: &str) -> bool {
+    let p = std::path::Path::new(candidate);
+    if p.is_absolute() {
+        return p.is_file();
     }
-    None
+    let Ok(path) = std::env::var("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path)
+        .any(|dir| dir.join(format!("{}.exe", candidate)).is_file() || dir.join(candidate).is_file())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn player_exists(candidate: &str) -> bool {
+    Command::new(candidate)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok()
 }
 
 fn player_candidates() -> Vec<String> {
-    let mut v: Vec<String> = vec!["mpv".into(), "vlc".into()];
-    // On Windows, VLC and mpv are rarely in PATH — check registry then fallback paths.
+    // Ordered by preference: every mpv location before any vlc one.
+    let mut v: Vec<String> = vec!["mpv".into()];
+    // On Windows, neither player is usually in PATH — add their install locations.
+    #[cfg(target_os = "windows")]
+    {
+        // mpv portable is commonly unpacked into %LOCALAPPDATA%\mpv or %APPDATA%\mpv.
+        for var in &["LOCALAPPDATA", "APPDATA"] {
+            if let Ok(base) = std::env::var(var) {
+                v.push(format!(r"{}\mpv\mpv.exe", base));
+            }
+        }
+    }
+    v.push("vlc".into());
     #[cfg(target_os = "windows")]
     {
         // Registry is the most reliable source: VLC always writes its path there.
@@ -907,12 +934,6 @@ fn player_candidates() -> Vec<String> {
         for var in &["PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432"] {
             if let Ok(pf) = std::env::var(var) {
                 v.push(format!(r"{}\VideoLAN\VLC\vlc.exe", pf));
-            }
-        }
-        // mpv portable is commonly placed in %LOCALAPPDATA%\mpv or %APPDATA%\mpv.
-        for var in &["LOCALAPPDATA", "APPDATA"] {
-            if let Ok(base) = std::env::var(var) {
-                v.push(format!(r"{}\mpv\mpv.exe", base));
             }
         }
     }
@@ -946,8 +967,24 @@ fn vlc_from_registry() -> Option<String> {
     None
 }
 
+/// Ask rqbit for the head of the stream so it starts fetching the first pieces
+/// straight away, instead of sitting idle for the second or two the player
+/// spends starting up before it makes its own first request. Fire-and-forget:
+/// rqbit caches pieces, so the player's request is served from what this pulled.
+fn warm_stream(url: &str) {
+    let url = url.to_string();
+    thread::spawn(move || {
+        let _ = minreq::get(&url)
+            .with_header("Range", "bytes=0-1048575")
+            .with_timeout(30)
+            .send();
+    });
+}
+
 /// Spawns the media player with an appropriate title flag.
 fn spawn_player(player_cmd: &str, url: &str, title: &str) -> std::io::Result<std::process::Child> {
+    warm_stream(url);
+
     let mut parts = player_cmd.split_whitespace();
     let bin = parts.next().unwrap_or("mpv");
     let extra: Vec<&str> = parts.collect();
@@ -958,7 +995,15 @@ fn spawn_player(player_cmd: &str, url: &str, title: &str) -> std::io::Result<std
     if bin_lc.contains("mpv") {
         cmd.arg(format!("--force-media-title={}", title));
     } else if bin_lc.contains("vlc") {
-        cmd.args(["--meta-title", title]);
+        // `--opt=value`, not `--opt value`: given a detached value VLC treats it
+        // as a second playlist entry, which leaves the stream queued but never
+        // started (you have to double-click it in the playlist to play).
+        cmd.arg(format!("--meta-title={}", title));
+        // Hand the URL to a *fresh* instance. If one is already running, VLC
+        // would otherwise enqueue into it rather than play.
+        cmd.arg("--no-one-instance");
+        // Quit when the stream ends so the temp dir gets cleaned up.
+        cmd.arg("--play-and-exit");
     }
     cmd.arg(url)
         .stdin(Stdio::null())
