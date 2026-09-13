@@ -1,7 +1,8 @@
+use crate::history::{self, Kind as HistoryKind};
 use crate::omdb;
 use crate::rqbit::{Client, FileDetails, TorrentStats};
 use crate::search::{self, SearchResult};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -55,7 +56,9 @@ pub enum View {
     Files,
     AddInput,
     ConfirmDelete,
+    ConfirmQuit,
     SearchResults,
+    History,
 }
 
 pub enum SearchStatus {
@@ -104,6 +107,9 @@ pub enum FileSortMode {
 
 pub struct SearchPreview {
     pub result_idx: usize,
+    /// What was added (magnet/URL) and the result's title — kept for history.
+    pub target: String,
+    pub title: String,
     pub file_selected: usize,
     pub file_sort: FileSortMode,
     pub state: Arc<Mutex<PreviewState>>,
@@ -154,6 +160,20 @@ pub struct App {
     pub stop_engine_on_quit: bool,
     pub show_help: bool,
     pub tick: u64,
+
+    // History view
+    pub history: Vec<history::Entry>,
+    pub history_selected: usize,
+
+    /// Torrents added only to stream or preview. They live in temp dirs and are
+    /// forgotten afterwards, so they don't count as downloads worth keeping alive.
+    pub stream_ids: Arc<Mutex<HashSet<u64>>>,
+    /// True when this process owns the engine, so quitting would stop downloads.
+    pub embedded: bool,
+    /// Set by the quit prompt: hand unfinished downloads to a background engine.
+    pub keep_downloading: bool,
+    /// View to go back to if the quit prompt is cancelled.
+    pub quit_return_view: View,
 }
 
 impl App {
@@ -188,6 +208,12 @@ impl App {
             stop_engine_on_quit: false,
             show_help: !help_seen(),
             tick: 0,
+            history: Vec::new(),
+            history_selected: 0,
+            stream_ids: Arc::new(Mutex::new(HashSet::new())),
+            embedded: true,
+            keep_downloading: false,
+            quit_return_view: View::Home,
         }
     }
 
@@ -331,6 +357,7 @@ impl App {
         let player_cmd = find_player();
 
         if player_cmd.is_none() {
+            history::record(&label, &target, HistoryKind::Download, None);
             self.status = format!("⬇ adding: {} — no player found, downloading…", label);
             thread::spawn(move || match client.add(&target) {
                 Ok(_) => {
@@ -347,7 +374,9 @@ impl App {
         }
 
         let player_cmd = player_cmd.unwrap();
+        history::record(&label, &target, HistoryKind::Stream, None);
         self.status = format!("⧗ adding: {} …", label);
+        let stream_ids = Arc::clone(&self.stream_ids);
 
         thread::spawn(move || {
             // Unique temp dir so concurrent streams don't collide.
@@ -368,6 +397,7 @@ impl App {
                     return;
                 }
             };
+            stream_ids.lock().unwrap().insert(id);
             let _ = tx.send("⧗ resolving metadata…".into());
 
             let deadline = std::time::Instant::now() + Duration::from_secs(60);
@@ -400,6 +430,8 @@ impl App {
                 return;
             };
 
+            // Fetch just this file — the rest of a pack would compete with it for peers.
+            client.update_only_files(id, &[idx]).ok();
             let url = client.stream_url(id, idx);
             let title = file.name.clone();
 
@@ -412,6 +444,7 @@ impl App {
                     ));
                     child.wait().ok();
                     client.forget(id).ok();
+                    stream_ids.lock().unwrap().remove(&id);
                     let cleaned = std::fs::remove_dir_all(&temp_dir).is_ok();
                     let _ = tx.send(if cleaned {
                         format!("✓ done: {} — temp files deleted", title)
@@ -524,6 +557,7 @@ impl App {
         let target = target.to_string();
         let label = label.to_string();
         let dest = download_dir();
+        history::record(&label, &target, HistoryKind::Download, Some(dest.display().to_string()));
         self.status = format!("⬇ queuing: {} → {}", label, dest.display());
         thread::spawn(move || {
             std::fs::create_dir_all(&dest).ok();
@@ -567,16 +601,16 @@ impl App {
         let target = match &*self.search.lock().unwrap() {
             SearchStatus::Done(v) => {
                 let filtered = self.filtered_results(v);
-                filtered.get(self.search_selected).and_then(|r| r.add_target()).map(str::to_string)
+                filtered.get(self.search_selected).and_then(|r| r.add_target().map(|t| (t.to_string(), r.title.clone())))
             }
             SearchStatus::Searching(partial) => {
                 let v = partial.lock().unwrap();
                 let filtered = self.filtered_results(&v);
-                filtered.get(self.search_selected).and_then(|r| r.add_target()).map(str::to_string)
+                filtered.get(self.search_selected).and_then(|r| r.add_target().map(|t| (t.to_string(), r.title.clone())))
             }
             _ => None,
         };
-        let Some(target) = target else { return };
+        let Some((target, title)) = target else { return };
 
         let state: Arc<Mutex<PreviewState>> = Arc::new(Mutex::new(PreviewState::Loading));
         let torrent_id: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
@@ -593,6 +627,8 @@ impl App {
 
         self.search_preview = Some(SearchPreview {
             result_idx: self.search_selected,
+            target: target.clone(),
+            title,
             file_selected: 0,
             file_sort: FileSortMode::Name,
             state: Arc::clone(&state),
@@ -604,6 +640,7 @@ impl App {
 
         let client = self.client.clone();
         let tx = self.status_tx.clone();
+        let stream_ids = Arc::clone(&self.stream_ids);
         thread::spawn(move || {
             let id = match client.add_to_dir(&target, &temp_dir) {
                 Ok(id) => id,
@@ -613,6 +650,7 @@ impl App {
                     return;
                 }
             };
+            stream_ids.lock().unwrap().insert(id);
             *torrent_id.lock().unwrap() = Some(id);
 
             if *cancelled.lock().unwrap() {
@@ -638,6 +676,18 @@ impl App {
                 match client.details(id) {
                     Ok(d) if !d.files.is_empty() => {
                         let _ = tx.send(format!("✓ {} files", d.files.len()));
+                        // Rather than pulling the whole pack while the user browses,
+                        // fetch only the likeliest pick until they actually choose.
+                        let best = d
+                            .files
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, f)| is_video(&f.name))
+                            .max_by_key(|(_, f)| f.length)
+                            .map(|(i, _)| i);
+                        if let Some(best) = best {
+                            client.update_only_files(id, &[best]).ok();
+                        }
                         let indexed = d.files.into_iter().enumerate().collect();
                         *state.lock().unwrap() = PreviewState::Ready(indexed);
                         return;
@@ -654,6 +704,7 @@ impl App {
             *preview.cancelled.lock().unwrap() = true;
             if let Some(id) = *preview.torrent_id.lock().unwrap() {
                 self.client.forget(id).ok();
+                self.stream_ids.lock().unwrap().remove(&id);
             }
             std::fs::remove_dir_all(&preview.temp_dir).ok();
         }
@@ -727,6 +778,12 @@ impl App {
         // Promote the preview to a live stream — take ownership so cleanup doesn't double-forget
         let preview = self.search_preview.take().unwrap();
         let temp_dir = preview.temp_dir.clone();
+        history::record(
+            &format!("{} — {}", preview.title, file_name),
+            &preview.target,
+            HistoryKind::Stream,
+            None,
+        );
         // Mark cancelled so the background loader thread won't touch it if still running
         *preview.cancelled.lock().unwrap() = true;
 
@@ -737,9 +794,12 @@ impl App {
             return;
         };
 
+        // Switch the fetch over to the file they picked, and only that file.
+        self.client.update_only_files(id, &[file_idx]).ok();
         let url = self.client.stream_url(id, file_idx);
         let client = self.client.clone();
         let tx = self.status_tx.clone();
+        let stream_ids = Arc::clone(&self.stream_ids);
         let title = file_name.clone();
 
         match spawn_player(&player_cmd, &url, &title) {
@@ -748,6 +808,7 @@ impl App {
                 thread::spawn(move || {
                     child.wait().ok();
                     client.forget(id).ok();
+                    stream_ids.lock().unwrap().remove(&id);
                     std::fs::remove_dir_all(&temp_dir).ok();
                     let _ = tx.send(format!("✓ done: {} — temp files deleted", title));
                 });
@@ -785,6 +846,71 @@ impl App {
                 self.download_to_disk_async(&target, &r.title);
             }
         }
+    }
+
+    // ---------- quitting ----------
+
+    /// Unfinished downloads that quitting would stop: excludes streams/previews
+    /// and anything paused or errored, which wouldn't progress anyway.
+    pub fn active_download_count(&self) -> usize {
+        let streams = self.stream_ids.lock().unwrap();
+        self.rows_snapshot()
+            .iter()
+            .filter(|r| !streams.contains(&r.id))
+            .filter(|r| match &r.stats {
+                Some(s) => !s.finished && s.state != "paused" && s.state != "error",
+                None => false,
+            })
+            .count()
+    }
+
+    /// Quit — but when this process owns the engine and downloads are still
+    /// running, first ask whether to keep them going in the background.
+    pub fn request_quit(&mut self) {
+        if self.embedded && self.active_download_count() > 0 {
+            if self.view != View::ConfirmQuit {
+                self.quit_return_view = self.view.clone();
+            }
+            self.view = View::ConfirmQuit;
+        } else {
+            self.should_quit = true;
+        }
+    }
+
+    // ---------- history ----------
+
+    pub fn open_history(&mut self) {
+        self.history = history::load();
+        self.history_selected = self.history_selected.min(self.history.len().saturating_sub(1));
+        self.view = View::History;
+        self.status = "Enter: stream again   d: download   x: remove   Tab/Esc: home".into();
+    }
+
+    fn selected_history(&self) -> Option<history::Entry> {
+        self.history.get(self.history_selected).cloned()
+    }
+
+    pub fn history_play(&mut self) {
+        let Some(e) = self.selected_history() else { return };
+        self.add_and_play_async(&e.target, &e.title);
+        self.history = history::load();
+        self.history_selected = 0;
+    }
+
+    pub fn history_download(&mut self) {
+        let Some(e) = self.selected_history() else { return };
+        self.download_to_disk_async(&e.target, &e.title);
+        self.history = history::load();
+        self.history_selected = 0;
+    }
+
+    pub fn history_remove(&mut self) {
+        if self.history_selected >= self.history.len() {
+            return;
+        }
+        self.history.remove(self.history_selected);
+        history::save(&self.history);
+        self.history_selected = self.history_selected.min(self.history.len().saturating_sub(1));
     }
 
     fn fetch_ratings_for(&self, title: &str, year: &str, api_key: &str) {

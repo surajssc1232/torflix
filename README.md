@@ -142,8 +142,9 @@ Fetches the torrent's file list from peers before you commit to streaming.
 | `d` | remove torrent (keep files) |
 | `D` | remove torrent and delete files |
 | `s` / `Esc` | back to home / search |
-| `q` | quit |
-| `Q` | quit and stop the rqbit engine |
+| `Tab` / `H` | go to history |
+| `q` | quit (asks whether to keep downloads going in the background) |
+| `Q` | quit and stop background downloads |
 
 ### Files view
 
@@ -153,6 +154,20 @@ Fetches the torrent's file list from peers before you commit to streaming.
 | `Enter` / `l` | stream selected file |
 | `p` | play all files as playlist |
 | `Esc` / `h` | back |
+
+### History view (press `Tab` from downloads)
+
+Everything you stream or download is remembered, newest first.
+
+| Key | Action |
+|-----|--------|
+| `j` / `k` | navigate |
+| `Enter` / `l` | stream it again |
+| `d` | download permanently |
+| `x` | remove from history |
+| `Tab` / `Esc` | back to home |
+
+History is stored in `~/.local/share/torflix/history.json` (`%LOCALAPPDATA%\torflix` on Windows).
 
 ## Search backends
 
@@ -220,6 +235,23 @@ Set `TORFLIX_OMDB_KEY` to show IMDb and Rotten Tomatoes scores for your search q
 **Without a player:**
 - Torrent downloads permanently to `TORFLIX_DOWNLOAD_DIR`
 - Track progress in the downloads view (`Tab`)
+
+When streaming from a multi-file torrent (a season pack, say), torflix fetches only the episode you're watching, so the rest of the pack doesn't compete with it for peers and bandwidth.
+
+## Background downloads
+
+Downloads survive quitting. Press `q` with downloads still running and torflix asks:
+
+- **`y`** — keep downloading in the background. A headless engine takes over, and stops itself once everything has finished.
+- **`n`** — quit now. Unfinished downloads pause and resume where they left off the next time you open torflix.
+
+Open torflix again while background downloads are running and it connects to them, so you can keep watching progress. To stop them:
+
+```bash
+torflix --stop
+```
+
+or press `Q` in the downloads view.
 
 ## Notes
 

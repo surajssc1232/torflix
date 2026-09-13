@@ -1,4 +1,6 @@
 mod app;
+mod daemon;
+mod history;
 mod omdb;
 mod rqbit;
 mod search;
@@ -44,48 +46,60 @@ fn main() -> Result<()> {
     // Parse CLI flags before anything else so download_dir() picks up -d.
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
     let mut positional: Vec<String> = Vec::new();
+    let mut daemon_mode = false;
+    let mut stop_mode = false;
     let mut i = 0;
     while i < raw_args.len() {
-        if raw_args[i] == "-d" {
-            i += 1;
-            match raw_args.get(i) {
-                Some(path) => std::env::set_var("TORFLIX_DOWNLOAD_DIR", path),
-                None => anyhow::bail!("'-d' requires a path argument"),
+        match raw_args[i].as_str() {
+            "-d" => {
+                i += 1;
+                match raw_args.get(i) {
+                    Some(path) => std::env::set_var("TORFLIX_DOWNLOAD_DIR", path),
+                    None => anyhow::bail!("'-d' requires a path argument"),
+                }
             }
-        } else if !raw_args[i].starts_with('-') {
-            positional.push(raw_args[i].clone());
+            "--daemon" => daemon_mode = true,
+            "--stop" => stop_mode = true,
+            a if !a.starts_with('-') => positional.push(a.to_string()),
+            _ => {}
         }
         i += 1;
     }
 
     let api_url =
         std::env::var("TORFLIX_RQBIT_URL").unwrap_or_else(|_| rqbit::DEFAULT_API.to_string());
-    let client = Client::new(&api_url);
 
-    // Start the embedded rqbit engine if no external one is running.
-    let mut embedded_engine = None;
-    if !client.is_up() {
-        let engine = rqbit::start_embedded_engine(&download_dir())?;
-        embedded_engine = Some(engine);
-        let mut ok = false;
-        for _ in 0..40 {
-            std::thread::sleep(Duration::from_millis(250));
-            if client.is_up() {
-                ok = true;
-                break;
-            }
+    if daemon_mode {
+        return daemon::run(&download_dir(), &api_url);
+    }
+    if stop_mode {
+        if daemon::request_stop() {
+            println!("torflix: background downloads stopped — they'll resume next time you open torflix.");
+        } else {
+            println!("torflix: no background downloads are running.");
         }
-        if !ok {
-            if let Some(mut e) = embedded_engine {
-                e.stop();
-            }
-            anyhow::bail!("rqbit engine did not come up on {}", api_url);
-        }
+        return Ok(());
     }
 
-    purge_stale_temp_dirs();
+    let client = Client::new(&api_url);
+
+    // Use an engine that's already running (typically our own background daemon);
+    // otherwise start one in-process.
+    let mut embedded_engine = None;
+    if !client.is_up() {
+        daemon::clear_stale();
+        embedded_engine = Some(rqbit::start_embedded_engine(&download_dir(), &api_url)?);
+        // Only clean up when the engine is ours: another torflix could be
+        // streaming through a shared engine right now.
+        rqbit::forget_temp_torrents(&client);
+        purge_stale_temp_dirs();
+    }
 
     let mut app = App::new(client);
+    app.embedded = embedded_engine.is_some();
+    if !app.embedded && daemon::is_running() {
+        app.status = "connected to background engine — downloads kept going while torflix was closed".into();
+    }
     app.spawn_poller();
 
     // Add magnet/URL/.torrent paths passed on the command line.
@@ -113,8 +127,30 @@ fn main() -> Result<()> {
     execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableBracketedPaste)?;
     terminal.show_cursor()?;
 
+    let active = app.active_download_count();
     if let Some(mut e) = embedded_engine {
+        // Stopping first frees the API port for the daemon and flushes resume state.
         e.stop();
+        if app.keep_downloading {
+            match daemon::spawn_detached() {
+                Ok(()) => println!(
+                    "torflix: {} download(s) continuing in the background.\n  \
+                     Open torflix to check on them, or run `torflix --stop` to stop them.",
+                    active
+                ),
+                Err(err) => eprintln!(
+                    "torflix: couldn't keep downloading in the background ({err:#}).\n  \
+                     They'll resume next time you open torflix."
+                ),
+            }
+        } else if active > 0 {
+            println!(
+                "torflix: {} unfinished download(s) paused — they'll resume next time you open torflix.",
+                active
+            );
+        }
+    } else if app.stop_engine_on_quit && daemon::request_stop() {
+        println!("torflix: background downloads stopped — they'll resume next time you open torflix.");
     }
 
     res
@@ -172,7 +208,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                             }
                             // q quits when the search bar is empty, otherwise types into it
                             KeyCode::Char('q') if app.search_query.is_empty() => {
-                                app.should_quit = true;
+                                app.request_quit();
                             }
                             KeyCode::Char(c) => app.search_query.push(c),
                             _ => {}
@@ -201,7 +237,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                                 KeyCode::Char('d') => app.download_from_preview(),
                                 KeyCode::Char('o') => app.preview_cycle_sort(),
                                 KeyCode::Char('f') | KeyCode::Esc | KeyCode::Char('h') => app.close_search_preview(),
-                                KeyCode::Char('q') => app.should_quit = true,
+                                KeyCode::Char('q') => app.request_quit(),
                                 _ => {}
                             }
                         } else if app.search_filter_active {
@@ -241,7 +277,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                                 KeyCode::Esc | KeyCode::Char('h') => {
                                     app.view = View::Home;
                                 }
-                                KeyCode::Char('q') => app.should_quit = true,
+                                KeyCode::Char('q') => app.request_quit(),
                                 KeyCode::Char('s') => {
                                     app.search_query.clear();
                                     app.view = View::Home;
@@ -273,12 +309,36 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                         KeyCode::Char('y') | KeyCode::Char('Y') => app.confirm_delete(),
                         _ => app.view = View::Torrents,
                     },
+                    View::ConfirmQuit => match key.code {
+                        KeyCode::Char('y') | KeyCode::Char('Y') => {
+                            app.keep_downloading = true;
+                            app.should_quit = true;
+                        }
+                        KeyCode::Char('n') | KeyCode::Char('N') => app.should_quit = true,
+                        _ => app.view = app.quit_return_view.clone(),
+                    },
+                    View::History => match key.code {
+                        KeyCode::Esc | KeyCode::Char('s') | KeyCode::Tab => app.view = View::Home,
+                        KeyCode::Char('q') => app.request_quit(),
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            app.history_selected = app.history_selected.saturating_sub(1);
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            if !app.history.is_empty() {
+                                app.history_selected = (app.history_selected + 1).min(app.history.len() - 1);
+                            }
+                        }
+                        KeyCode::Enter | KeyCode::Char('l') => app.history_play(),
+                        KeyCode::Char('d') => app.history_download(),
+                        KeyCode::Char('x') => app.history_remove(),
+                        _ => {}
+                    },
                     View::Files => match key.code {
                         KeyCode::Esc | KeyCode::Char('h') | KeyCode::Backspace => {
                             app.view = View::Torrents;
                             app.status = "a: add magnet/URL  Enter: files  Space: pause  q: quit".into();
                         }
-                        KeyCode::Char('q') => app.should_quit = true,
+                        KeyCode::Char('q') => app.request_quit(),
                         KeyCode::Up | KeyCode::Char('k') => {
                             app.file_selected = app.file_selected.saturating_sub(1);
                         }
@@ -292,7 +352,8 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                         _ => {}
                     },
                     View::Torrents => match key.code {
-                        KeyCode::Char('q') => app.should_quit = true,
+                        KeyCode::Char('q') => app.request_quit(),
+                        KeyCode::Tab | KeyCode::Char('H') => app.open_history(),
                         KeyCode::Char('Q') => {
                             app.stop_engine_on_quit = true;
                             app.should_quit = true;

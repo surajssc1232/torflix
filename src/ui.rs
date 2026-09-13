@@ -1,4 +1,5 @@
 use crate::app::{human_bytes, is_video, App, FileSortMode, PreviewState, SearchPreview, SearchStatus, SortMode, View};
+use crate::history;
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -21,6 +22,19 @@ pub fn draw(f: &mut Frame, app: &App) {
     let area = f.size();
     f.render_widget(Block::default().style(Style::default().bg(BG).fg(FG)), area);
 
+    // Home needs 14 rows (title + 11-row logo/search block + status + help) and
+    // its search bar is at least 20 columns wide. Smaller than that, bordered
+    // widgets land outside the buffer and ratatui 0.26 panics, so say so instead.
+    if area.width < 20 || area.height < 14 {
+        if area.width > 0 && area.height > 0 {
+            f.render_widget(
+                Paragraph::new(Span::styled("terminal too small", Style::default().fg(YELLOW))),
+                area,
+            );
+        }
+        return;
+    }
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -33,10 +47,13 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     draw_title(f, chunks[0], app);
 
-    match app.view {
+    // The quit prompt floats over whatever screen it was opened from.
+    let base = if app.view == View::ConfirmQuit { &app.quit_return_view } else { &app.view };
+    match base {
         View::Home        => draw_home(f, chunks[1], app),
         View::Files       => draw_files(f, chunks[1], app),
         View::SearchResults => draw_search_results(f, chunks[1], app),
+        View::History     => draw_history(f, chunks[1], app),
         _                 => draw_torrents(f, chunks[1], app),
     }
 
@@ -49,6 +66,9 @@ pub fn draw(f: &mut Frame, app: &App) {
     if app.view == View::ConfirmDelete {
         draw_confirm_popup(f, area, app);
     }
+    if app.view == View::ConfirmQuit {
+        draw_quit_popup(f, area, app);
+    }
     if app.show_help {
         draw_help_popup(f, area);
     }
@@ -56,7 +76,8 @@ pub fn draw(f: &mut Frame, app: &App) {
 
 fn draw_title(f: &mut Frame, area: Rect, app: &App) {
     let engine = if *app.engine_up.lock().unwrap() {
-        Span::styled(" engine: online ", Style::default().fg(GREEN))
+        let label = if app.embedded { " engine: online " } else { " engine: background " };
+        Span::styled(label, Style::default().fg(GREEN))
     } else {
         Span::styled(" engine: OFFLINE ", Style::default().fg(RED).add_modifier(Modifier::BOLD))
     };
@@ -332,7 +353,9 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
                             => " type: filter   Backspace: delete   Ctrl+U: clear   Esc: clear+close   Enter: keep+close",
         View::SearchResults => " /: filter   f: files   Enter: stream   d: download   o: sort   s: new search   Esc: back",
         View::ConfirmDelete => " y: confirm   n/Esc: cancel",
-        View::Torrents      => " s/Esc: search   a: add   Enter: files   Space: pause   d: remove   q: quit",
+        View::Torrents      => " s/Esc: search   Tab: history   a: add   Enter: files   Space: pause   d: remove   q: quit",
+        View::History       => " Enter: stream again   d: download   x: remove   j/k: move   Tab/Esc: home   q: quit",
+        View::ConfirmQuit   => " y: keep downloading in background   n: quit and pause   Esc: cancel",
         View::AddInput      => " Enter: add   Esc: cancel",
     };
     f.render_widget(
@@ -342,7 +365,7 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_help_popup(f: &mut Frame, area: Rect) {
-    let popup = centered_rect(70, 22, area);
+    let popup = centered_rect(70, 38, area);
     f.render_widget(Clear, popup);
 
     fn key(k: &'static str) -> Span<'static> {
@@ -384,7 +407,13 @@ fn draw_help_popup(f: &mut Frame, area: Rect) {
         row("Space",       "pause / resume torrent"),
         row("d / D",       "remove (keep files) / remove + delete files"),
         row("s  or  Esc",  "go to home / search"),
-        row("q / Q",       "quit / quit and stop engine"),
+        row("Tab / H",     "go to history"),
+        row("q / Q",       "quit / quit and stop background downloads"),
+        Line::from(""),
+        section("History view"),
+        row("Enter",       "stream it again"),
+        row("d",           "download permanently"),
+        row("x",           "remove from history"),
         Line::from(""),
         Line::from(Span::styled("  press ? to open this again  ·  any key to close", Style::default().fg(GRAY))),
     ];
@@ -393,6 +422,95 @@ fn draw_help_popup(f: &mut Frame, area: Rect) {
         Block::default()
             .borders(Borders::ALL)
             .title(" keyboard shortcuts ")
+            .border_style(Style::default().fg(YELLOW))
+            .style(Style::default().bg(BG)),
+    );
+    f.render_widget(p, popup);
+}
+
+fn draw_history(f: &mut Frame, area: Rect, app: &App) {
+    if app.history.is_empty() {
+        let msg = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "no history yet",
+                Style::default().fg(GRAY).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "everything you stream or download shows up here",
+                Style::default().fg(GRAY),
+            )),
+        ])
+        .alignment(Alignment::Center)
+        .block(Block::default().borders(Borders::ALL).title(" history ").border_style(Style::default().fg(GRAY)));
+        f.render_widget(msg, area);
+        return;
+    }
+
+    let now = history::now();
+    let rows: Vec<Row> = app
+        .history
+        .iter()
+        .map(|e| {
+            let (kind, color) = match e.kind {
+                history::Kind::Stream => ("▶ stream", AQUA),
+                history::Kind::Download => ("⬇ download", GREEN),
+            };
+            let mut title = vec![Span::styled(e.title.clone(), Style::default().fg(FG))];
+            if let Some(dest) = &e.dest {
+                title.push(Span::styled(format!("  → {}", dest), Style::default().fg(GRAY)));
+            }
+            Row::new(vec![
+                ratatui::widgets::Cell::from(history::format_when(e.at, now)).style(Style::default().fg(GRAY)),
+                ratatui::widgets::Cell::from(kind).style(Style::default().fg(color)),
+                ratatui::widgets::Cell::from(Line::from(title)),
+            ])
+        })
+        .collect();
+
+    let table = Table::new(
+        rows,
+        [Constraint::Length(11), Constraint::Length(11), Constraint::Min(20)],
+    )
+    .header(
+        Row::new(vec!["when", "type", "title"])
+            .style(Style::default().fg(YELLOW).add_modifier(Modifier::BOLD)),
+    )
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" history ({}) ", app.history.len()))
+            .border_style(Style::default().fg(GRAY)),
+    )
+    .highlight_style(Style::default().bg(Color::Rgb(0x3c, 0x38, 0x36)).add_modifier(Modifier::BOLD))
+    .highlight_symbol("▶ ");
+
+    let mut state = TableState::default();
+    state.select(Some(app.history_selected.min(app.history.len().saturating_sub(1))));
+    f.render_stateful_widget(table, area, &mut state);
+}
+
+fn draw_quit_popup(f: &mut Frame, area: Rect, app: &App) {
+    let popup = centered_rect(62, 9, area);
+    f.render_widget(Clear, popup);
+    let n = app.active_download_count();
+    let key = |k: &'static str| Span::styled(format!("  {:<5}", k), Style::default().fg(YELLOW).add_modifier(Modifier::BOLD));
+    let p = Paragraph::new(vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  {} download{} still in progress", n, if n == 1 { "" } else { "s" }),
+            Style::default().fg(FG).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(vec![key("y"), Span::styled("keep downloading in the background", Style::default().fg(FG))]),
+        Line::from(vec![key("n"), Span::styled("quit and pause them (resume next launch)", Style::default().fg(FG))]),
+        Line::from(vec![key("Esc"), Span::styled("cancel", Style::default().fg(GRAY))]),
+    ])
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" quit torflix? ")
             .border_style(Style::default().fg(YELLOW))
             .style(Style::default().bg(BG)),
     );
