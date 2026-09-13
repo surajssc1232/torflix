@@ -1,13 +1,19 @@
 mod app;
+mod commands;
+mod config;
 mod daemon;
+mod favorites;
 mod history;
 mod omdb;
+mod progress;
 mod rqbit;
 mod search;
+mod stremio;
+mod tv;
 mod ui;
 
 use anyhow::Result;
-use app::{App, View};
+use app::{App, InputPurpose, View};
 use crossterm::{
     event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
@@ -34,6 +40,9 @@ fn purge_stale_temp_dirs() {
 
 fn download_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("TORFLIX_DOWNLOAD_DIR") {
+        return PathBuf::from(dir);
+    }
+    if let Some(dir) = config::load().download_dir.filter(|d| !d.trim().is_empty()) {
         return PathBuf::from(dir);
     }
     dirs::video_dir()
@@ -161,6 +170,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
         while let Ok(msg) = app.status_rx.try_recv() {
             app.status = msg;
         }
+        app.poll_background();
 
         if app.view == View::SearchResults {
             app.maybe_fetch_search_ratings();
@@ -180,6 +190,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                     app.search_filter.push_str(&text);
                     app.search_selected = 0;
                 }
+                View::Tv if app.tv_filter_active => {
+                    app.tv_filter.push_str(&text);
+                    app.tv_selected = 0;
+                }
                 _ => {}
             },
             Event::Key(key) if key.kind == KeyEventKind::Press => {
@@ -195,7 +209,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                 match app.view {
                     View::Home => {
                         match key.code {
-                            KeyCode::Enter => app.start_search(),
+                            KeyCode::Enter => app.submit_home(),
+                            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                app.toggle_search_source();
+                            }
                             KeyCode::Backspace => { app.search_query.pop(); }
                             KeyCode::Esc => app.search_query.clear(),
                             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -215,10 +232,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                         }
                     }
                     View::AddInput => match key.code {
-                        KeyCode::Esc => {
-                            app.input.clear();
-                            app.view = View::Home;
-                        }
+                        KeyCode::Esc => app.cancel_input(),
                         KeyCode::Enter => app.submit_add(),
                         KeyCode::Backspace => { app.input.pop(); }
                         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -309,6 +323,120 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                         KeyCode::Char('y') | KeyCode::Char('Y') => app.confirm_delete(),
                         _ => app.view = View::Torrents,
                     },
+                    View::Discover => match key.code {
+                        KeyCode::Esc | KeyCode::Char('h') => app.view = View::Home,
+                        KeyCode::Char('q') => app.request_quit(),
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            app.catalog_selected = app.catalog_selected.saturating_sub(1);
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            let n = app.catalog_len();
+                            if n > 0 {
+                                app.catalog_selected = (app.catalog_selected + 1).min(n - 1);
+                            }
+                        }
+                        KeyCode::Enter | KeyCode::Char('l') => app.open_details(),
+                        KeyCode::Char('f') => app.toggle_favorite(),
+                        KeyCode::Char('b') => app.next_browse(),
+                        _ => {}
+                    },
+                    View::Details => match key.code {
+                        KeyCode::Esc | KeyCode::Char('h') | KeyCode::Backspace => app.details_back(),
+                        KeyCode::Char('q') => app.request_quit(),
+                        KeyCode::Up | KeyCode::Char('k') => app.details_move(false),
+                        KeyCode::Down | KeyCode::Char('j') => app.details_move(true),
+                        KeyCode::Tab | KeyCode::Right => app.details_pane(true),
+                        KeyCode::BackTab | KeyCode::Left => app.details_pane(false),
+                        KeyCode::Enter | KeyCode::Char('l') => app.details_enter(),
+                        KeyCode::Char('d') => app.download_selected_stream(),
+                        KeyCode::Char('f') => app.toggle_favorite(),
+                        KeyCode::Char('t') => app.search_torrents_for_details(),
+                        _ => {}
+                    },
+                    View::Tv if app.tv_filter_active => match key.code {
+                        KeyCode::Esc => {
+                            app.tv_filter.clear();
+                            app.tv_filter_active = false;
+                            app.tv_selected = 0;
+                        }
+                        KeyCode::Enter => app.tv_filter_active = false,
+                        KeyCode::Backspace => {
+                            app.tv_filter.pop();
+                            app.tv_selected = 0;
+                        }
+                        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            app.tv_filter.clear();
+                            app.tv_selected = 0;
+                        }
+                        KeyCode::Char(c) => {
+                            app.tv_filter.push(c);
+                            app.tv_selected = 0;
+                        }
+                        _ => {}
+                    },
+                    View::Tv if app.tv_manage => match key.code {
+                        KeyCode::Esc | KeyCode::Char('m') | KeyCode::Char('h') => app.tv_manage = false,
+                        KeyCode::Char('q') => app.request_quit(),
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            app.tv_playlist_selected = app.tv_playlist_selected.saturating_sub(1);
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            let n = app.tv_playlists.len();
+                            if n > 0 {
+                                app.tv_playlist_selected = (app.tv_playlist_selected + 1).min(n - 1);
+                            }
+                        }
+                        KeyCode::Char('a') => app.open_input(InputPurpose::Playlist),
+                        KeyCode::Char('x') | KeyCode::Delete => app.remove_playlist(),
+                        _ => {}
+                    },
+                    View::Tv => match key.code {
+                        KeyCode::Esc | KeyCode::Char('h') => app.view = View::Home,
+                        KeyCode::Char('q') => app.request_quit(),
+                        KeyCode::Char('/') => app.tv_filter_active = true,
+                        KeyCode::Up | KeyCode::Char('k') => app.tv_selected = app.tv_selected.saturating_sub(1),
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            let n = app.tv_visible_len();
+                            if n > 0 {
+                                app.tv_selected = (app.tv_selected + 1).min(n - 1);
+                            }
+                        }
+                        KeyCode::Enter | KeyCode::Char('l') => app.play_channel(),
+                        KeyCode::Char('a') => app.open_input(InputPurpose::Playlist),
+                        KeyCode::Char('m') => app.tv_manage = true,
+                        KeyCode::Char('r') => app.reload_tv(),
+                        _ => {}
+                    },
+                    View::Addons => match key.code {
+                        KeyCode::Esc | KeyCode::Char('h') => app.view = View::Home,
+                        KeyCode::Char('q') => app.request_quit(),
+                        KeyCode::Up | KeyCode::Char('k') => app.addon_selected = app.addon_selected.saturating_sub(1),
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            let n = app.addons.len();
+                            if n > 0 {
+                                app.addon_selected = (app.addon_selected + 1).min(n - 1);
+                            }
+                        }
+                        KeyCode::Char(' ') | KeyCode::Enter => app.toggle_addon(),
+                        KeyCode::Char('a') => app.open_input(InputPurpose::Addon),
+                        KeyCode::Char('x') | KeyCode::Delete => app.remove_addon(),
+                        _ => {}
+                    },
+                    View::Settings => match key.code {
+                        KeyCode::Esc | KeyCode::Char('h') => app.view = View::Home,
+                        KeyCode::Char('q') => app.request_quit(),
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            app.settings_selected = app.settings_selected.saturating_sub(1);
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            app.settings_selected = (app.settings_selected + 1).min(App::SETTINGS_ROWS - 1);
+                        }
+                        KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Right | KeyCode::Char('l') => {
+                            app.settings_change(true);
+                        }
+                        KeyCode::Left => app.settings_change(false),
+                        _ => {}
+                    },
                     View::ConfirmQuit => match key.code {
                         KeyCode::Char('y') | KeyCode::Char('Y') => {
                             app.keep_downloading = true;
@@ -358,10 +486,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                             app.stop_engine_on_quit = true;
                             app.should_quit = true;
                         }
-                        KeyCode::Char('a') => {
-                            app.input.clear();
-                            app.view = View::AddInput;
-                        }
+                        KeyCode::Char('a') => app.open_input(InputPurpose::Torrent),
                         KeyCode::Char('s') | KeyCode::Char('/') | KeyCode::Esc => {
                             app.search_query.clear();
                             app.view = View::Home;

@@ -474,7 +474,7 @@ fn search_nyaa(query: &str) -> Result<Vec<SearchResult>> {
 }
 
 
-fn build_magnet(hash: &str, name: &str) -> String {
+pub fn build_magnet(hash: &str, name: &str) -> String {
     const TRACKERS: &[&str] = &[
         "udp://tracker.opentrackr.org:1337/announce",
         "udp://open.demonii.com:1337/announce",
@@ -636,7 +636,7 @@ fn check_scheme(url: &str) -> Result<()> {
     Ok(())
 }
 
-fn urlencode(s: &str) -> String {
+pub fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 3);
     for b in s.bytes() {
         match b {

@@ -1,10 +1,10 @@
-use crate::app::{human_bytes, is_video, App, FileSortMode, PreviewState, SearchPreview, SearchStatus, SortMode, View};
+use crate::app::{human_bytes, is_video, App, Details, FileSortMode, InputPurpose, Load, Pane, PreviewState, SearchPreview, SearchStatus, SortMode, View};
 use crate::history;
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState},
+    widgets::{Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap},
     Frame,
 };
 
@@ -47,13 +47,22 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     draw_title(f, chunks[0], app);
 
-    // The quit prompt floats over whatever screen it was opened from.
-    let base = if app.view == View::ConfirmQuit { &app.quit_return_view } else { &app.view };
+    // Popups float over whatever screen opened them.
+    let base = match app.view {
+        View::ConfirmQuit => &app.quit_return_view,
+        View::AddInput => &app.input_return,
+        _ => &app.view,
+    };
     match base {
         View::Home        => draw_home(f, chunks[1], app),
         View::Files       => draw_files(f, chunks[1], app),
         View::SearchResults => draw_search_results(f, chunks[1], app),
         View::History     => draw_history(f, chunks[1], app),
+        View::Discover    => draw_discover(f, chunks[1], app),
+        View::Details     => draw_details(f, chunks[1], app),
+        View::Tv          => draw_tv(f, chunks[1], app),
+        View::Addons      => draw_addons(f, chunks[1], app),
+        View::Settings    => draw_settings(f, chunks[1], app),
         _                 => draw_torrents(f, chunks[1], app),
     }
 
@@ -161,7 +170,7 @@ fn draw_home(f: &mut Frame, area: Rect, app: &App) {
         Line::from(if q.is_empty() {
             vec![
                 Span::styled("  › ", Style::default().fg(AQUA).add_modifier(Modifier::BOLD)),
-                Span::styled("search for a movie or show…", Style::default().fg(GRAY)),
+                Span::styled("search for a movie or show…  (/ for commands)", Style::default().fg(GRAY)),
             ]
         } else {
             vec![
@@ -174,9 +183,34 @@ fn draw_home(f: &mut Frame, area: Rect, app: &App) {
     .block(
         Block::default()
             .borders(Borders::ALL)
+            .title(Span::styled(
+                format!(" {} · Ctrl+P ", app.config.search_source.label()),
+                Style::default().fg(YELLOW),
+            ))
             .border_style(Style::default().fg(if q.is_empty() { GRAY } else { AQUA })),
     );
     f.render_widget(p, bar_rect);
+
+    // Slash-command suggestions while typing "/…"
+    let suggestions = crate::commands::Command::suggest(q);
+    if !suggestions.is_empty() {
+        let top = bar_rect.y + bar_height;
+        let room = (area.y + area.height).saturating_sub(top) as usize;
+        let lines: Vec<Line> = suggestions
+            .iter()
+            .take(room)
+            .map(|c| {
+                Line::from(vec![
+                    Span::styled(format!("  {:<11}", c.name()), Style::default().fg(YELLOW)),
+                    Span::styled(c.description(), Style::default().fg(GRAY)),
+                ])
+            })
+            .collect();
+        if !lines.is_empty() {
+            let rect = Rect { x: bar_rect.x, y: top, width: bar_rect.width, height: lines.len() as u16 };
+            f.render_widget(Paragraph::new(lines), rect);
+        }
+    }
 
     // Hint below search bar when empty
     if q.is_empty() {
@@ -185,7 +219,7 @@ fn draw_home(f: &mut Frame, area: Rect, app: &App) {
             let hint_rect = Rect { x: area.x, y: hint_y, width: area.width, height: 1 };
             f.render_widget(
                 Paragraph::new(Span::styled(
-                    "Tab: downloads   q: quit (from downloads)",
+                    "Ctrl+P: torrents/catalog   /browse  /favorites  /history   Tab: downloads",
                     Style::default().fg(GRAY),
                 ))
                 .alignment(Alignment::Center),
@@ -345,7 +379,16 @@ fn status_style(status: &str) -> (String, Style) {
 
 fn draw_help(f: &mut Frame, area: Rect, app: &App) {
     let help: &str = match app.view {
-        View::Home          => " Enter: search   Tab: downloads   Esc: clear   q: quit   ?: help",
+        View::Home          => " Enter: search   Ctrl+P: torrents/catalog   /: commands   Tab: downloads   q: quit   ?: help",
+        View::Discover      => " Enter: open   f: star   b: next list   j/k: move   Esc: back   q: quit",
+        View::Details       => " Enter: select/play   Tab: next pane   d: download   f: star   t: search torrents   Esc: back",
+        View::Tv if app.tv_filter_active
+                            => " type: filter channels   Enter: keep   Esc: clear",
+        View::Tv if app.tv_manage
+                            => " a: add playlist   x: remove   j/k: move   Esc: back to channels",
+        View::Tv            => " Enter: play   /: filter   a: add playlist   m: manage playlists   r: reload   Esc: home",
+        View::Addons        => " Space: enable/disable   a: install by manifest URL   x: remove   Esc: home",
+        View::Settings      => " Enter/→: change   ←: previous   j/k: move   Esc: home",
         View::Files         => " Enter: play   p: playlist   j/k: move   Esc: back   q: quit",
         View::SearchResults if app.search_preview.is_some()
                             => " Enter: stream   d: download   j/k: move   o: sort   f/Esc: close preview",
@@ -365,7 +408,7 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_help_popup(f: &mut Frame, area: Rect) {
-    let popup = centered_rect(70, 38, area);
+    let popup = centered_rect(70, 52, area);
     f.render_widget(Clear, popup);
 
     fn key(k: &'static str) -> Span<'static> {
@@ -388,6 +431,21 @@ fn draw_help_popup(f: &mut Frame, area: Rect) {
         row("Enter",       "search for the typed query"),
         row("Esc",         "clear search query"),
         row("Tab",         "go to downloads view"),
+        row("Ctrl+P",      "switch search: torrents ↔ catalog (Stremio)"),
+        row("/",           "commands: /browse /favorites /history …"),
+        Line::from(""),
+        section("Catalog list & details"),
+        row("Enter",       "open title · pick season/episode · play stream"),
+        row("Tab",         "next pane (seasons → episodes → streams)"),
+        row("f",           "star / unstar"),
+        row("d",           "download the selected stream"),
+        row("t",           "search torrent indexers for this title"),
+        row("b",           "next /browse list"),
+        Line::from(""),
+        section("More screens"),
+        row("/tv",         "live TV from M3U playlists (a: add, m: manage)"),
+        row("/addons",     "install stream/subtitle addons by manifest URL"),
+        row("/settings",   "player, subtitle language, download folder"),
         Line::from(""),
         section("Search Results"),
         row("/",           "open filter bar (narrow by title substring)"),
@@ -491,6 +549,386 @@ fn draw_history(f: &mut Frame, area: Rect, app: &App) {
     f.render_stateful_widget(table, area, &mut state);
 }
 
+fn centered_message(f: &mut Frame, area: Rect, block: Block, msg: String, color: Color) {
+    f.render_widget(
+        Paragraph::new(vec![Line::from(""), Line::from(Span::styled(msg, Style::default().fg(color)))])
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true })
+            .block(block),
+        area,
+    );
+}
+
+fn highlight() -> Style {
+    Style::default().bg(Color::Rgb(0x3c, 0x38, 0x36)).add_modifier(Modifier::BOLD)
+}
+
+fn draw_discover(f: &mut Frame, area: Rect, app: &App) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {} ", app.catalog_title))
+        .border_style(Style::default().fg(GRAY));
+    let catalog = app.catalog.lock().unwrap();
+    let items = match &*catalog {
+        Load::Ready(items) if !items.is_empty() => items,
+        Load::Ready(_) if app.catalog_title == "favorites" => {
+            return centered_message(f, area, block, "no favorites yet — press f on a title to star it".into(), GRAY);
+        }
+        Load::Ready(_) => return centered_message(f, area, block, "nothing found".into(), GRAY),
+        Load::Failed(e) => return centered_message(f, area, block, format!("✗ {e}"), RED),
+        Load::Idle | Load::Loading => return centered_message(f, area, block, "loading…".into(), YELLOW),
+    };
+
+    let rows: Vec<Row> = items
+        .iter()
+        .map(|m| {
+            let (kind, color) = if m.is_series() { ("series", AQUA) } else { ("movie", ORANGE) };
+            Row::new(vec![
+                Cell::from(if app.is_favorite(&m.id) { "★" } else { "" }).style(Style::default().fg(YELLOW)),
+                Cell::from(m.name.clone()),
+                Cell::from(m.year_label()).style(Style::default().fg(GRAY)),
+                Cell::from(kind).style(Style::default().fg(color)),
+                Cell::from(m.imdb_rating.clone().unwrap_or_default()).style(Style::default().fg(YELLOW)),
+            ])
+        })
+        .collect();
+    let table = Table::new(
+        rows,
+        [Constraint::Length(2), Constraint::Min(20), Constraint::Length(10), Constraint::Length(7), Constraint::Length(5)],
+    )
+    .header(Row::new(vec!["", "title", "year", "type", "imdb"]).style(Style::default().fg(YELLOW).add_modifier(Modifier::BOLD)))
+    .block(block)
+    .highlight_style(highlight())
+    .highlight_symbol("▶ ");
+    let mut state = TableState::default();
+    state.select(Some(app.catalog_selected.min(items.len() - 1)));
+    f.render_stateful_widget(table, area, &mut state);
+}
+
+fn pane_list(f: &mut Frame, area: Rect, title: String, items: Vec<ListItem>, selected: usize, focused: bool) {
+    let n = items.len();
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_style(Style::default().fg(if focused { AQUA } else { GRAY })),
+        )
+        .highlight_style(if focused { highlight() } else { Style::default().fg(YELLOW) })
+        .highlight_symbol("› ");
+    let mut state = ListState::default();
+    if n > 0 {
+        state.select(Some(selected.min(n - 1)));
+    }
+    f.render_stateful_widget(list, area, &mut state);
+}
+
+fn draw_details(f: &mut Frame, area: Rect, app: &App) {
+    let Some(d) = app.details.as_ref() else { return };
+    let series = d.item.is_series();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(6), Constraint::Min(5)])
+        .split(area);
+
+    // Header: name, facts, description.
+    let mut facts: Vec<String> = Vec::new();
+    let mut extra = Line::from(Span::styled("loading details…", Style::default().fg(GRAY)));
+    {
+        let meta = d.meta.lock().unwrap();
+        match &*meta {
+            Load::Ready(m) => {
+                let year = m.year_label();
+                if !year.is_empty() {
+                    facts.push(year);
+                }
+                if let Some(r) = &m.imdb_rating {
+                    facts.push(format!("IMDb {r}"));
+                }
+                if let Some(rt) = &m.runtime {
+                    facts.push(rt.clone());
+                }
+                if !m.all_genres().is_empty() {
+                    facts.push(m.all_genres().iter().take(3).cloned().collect::<Vec<_>>().join(", "));
+                }
+                if !m.cast.is_empty() {
+                    facts.push(m.cast.iter().take(3).cloned().collect::<Vec<_>>().join(", "));
+                }
+                extra = Line::from(Span::styled(m.description.clone().unwrap_or_default(), Style::default().fg(FG)));
+            }
+            Load::Failed(e) => extra = Line::from(Span::styled(format!("✗ {e}"), Style::default().fg(RED))),
+            Load::Idle | Load::Loading => {}
+        }
+    }
+    let star = if app.is_favorite(&d.item.id) { "★ " } else { "" };
+    let header = vec![
+        Line::from(vec![
+            Span::styled(format!("{star}{}", d.item.name), Style::default().fg(YELLOW).add_modifier(Modifier::BOLD)),
+            Span::styled(if series { "   series" } else { "   movie" }, Style::default().fg(GRAY)),
+        ]),
+        Line::from(Span::styled(facts.join("  ·  "), Style::default().fg(AQUA))),
+        extra,
+    ];
+    f.render_widget(
+        Paragraph::new(header)
+            .wrap(Wrap { trim: true })
+            .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(GRAY))),
+        chunks[0],
+    );
+
+    let streams_area = if series {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(14), Constraint::Percentage(32), Constraint::Min(30)])
+            .split(chunks[1]);
+        let seasons = app.details_seasons();
+        let season_items = seasons
+            .iter()
+            .map(|s| ListItem::new(if s.number == 0 { "Specials".to_string() } else { format!("Season {}", s.number) }))
+            .collect();
+        pane_list(f, cols[0], " seasons ".into(), season_items, d.season_idx, d.pane == Pane::Seasons);
+        let episodes = seasons
+            .get(d.season_idx)
+            .map(|s| {
+                s.episodes
+                    .iter()
+                    .map(|e| {
+                        let title = if e.title.is_empty() { format!("Episode {}", e.number) } else { e.title.clone() };
+                        ListItem::new(format!("{:>2}  {}", e.number, title))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        pane_list(f, cols[1], " episodes ".into(), episodes, d.episode_idx, d.pane == Pane::Episodes);
+        cols[2]
+    } else {
+        chunks[1]
+    };
+    draw_streams(f, streams_area, d);
+}
+
+fn draw_streams(f: &mut Frame, area: Rect, d: &Details) {
+    let focused = d.pane == Pane::Streams;
+    let heading = match (d.item.is_series(), d.streams_for) {
+        (true, Some((s, e))) => format!(" streams — S{s:02}E{e:02} "),
+        (true, None) => " streams ".to_string(),
+        (false, _) => " streams ".to_string(),
+    };
+    let make_block = |title: String| {
+        Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .border_style(Style::default().fg(if focused { AQUA } else { GRAY }))
+    };
+    let block = make_block(heading.clone());
+    let streams = d.streams.lock().unwrap();
+    let list = match &*streams {
+        Load::Ready((list, _)) if !list.is_empty() => list,
+        Load::Ready((_, errors)) if !errors.is_empty() => {
+            return centered_message(f, area, block, format!("no streams — {}", errors.join("; ")), GRAY);
+        }
+        Load::Ready(_) => return centered_message(f, area, block, "no streams found — press t to search torrents instead".into(), GRAY),
+        Load::Loading => return centered_message(f, area, block, "finding streams…".into(), YELLOW),
+        Load::Failed(e) => return centered_message(f, area, block, format!("✗ {e}"), RED),
+        Load::Idle => return centered_message(f, area, block, "pick an episode and press Enter".into(), GRAY),
+    };
+
+    // Say which addon (or the built-in search) the streams came from: the source
+    // column shows the site each torrent was found on, which doesn't reveal that.
+    let mut by_addon: Vec<(&str, usize)> = Vec::new();
+    for s in list.iter() {
+        match by_addon.iter_mut().find(|(name, _)| *name == s.addon.as_str()) {
+            Some((_, count)) => *count += 1,
+            None => by_addon.push((s.addon.as_str(), 1)),
+        }
+    }
+    let from = by_addon
+        .iter()
+        .map(|(name, count)| format!("{name} {count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let block = make_block(format!("{}· from {from} ", heading));
+
+    let rows: Vec<Row> = list
+        .iter()
+        .map(|s| {
+            let quality_color = match s.quality.as_deref() {
+                Some("2160p") => ORANGE,
+                Some("1080p") => GREEN,
+                Some("720p") => AQUA,
+                _ => GRAY,
+            };
+            let (seeds, seed_color) = match s.seeders {
+                Some(n) if n >= 20 => (n.to_string(), GREEN),
+                Some(n) if n > 0 => (n.to_string(), YELLOW),
+                Some(n) => (n.to_string(), RED),
+                None if s.is_torrent() => ("?".to_string(), GRAY),
+                None => ("http".to_string(), AQUA),
+            };
+            let tags: Vec<String> = [s.codec.clone(), s.languages.clone()].into_iter().flatten().collect();
+            let release = Line::from(vec![
+                Span::raw(s.release.clone()),
+                Span::styled(
+                    if tags.is_empty() { String::new() } else { format!("  {}", tags.join(" · ")) },
+                    Style::default().fg(GRAY),
+                ),
+            ]);
+            Row::new(vec![
+                Cell::from(s.quality.clone().unwrap_or_else(|| "—".into())).style(Style::default().fg(quality_color)),
+                Cell::from(s.size.map(human_bytes).unwrap_or_default()),
+                Cell::from(seeds).style(Style::default().fg(seed_color)),
+                Cell::from(s.origin.clone().unwrap_or_else(|| s.addon.clone())).style(Style::default().fg(GRAY)),
+                Cell::from(release),
+            ])
+        })
+        .collect();
+    let table = Table::new(
+        rows,
+        [Constraint::Length(6), Constraint::Length(10), Constraint::Length(5), Constraint::Length(14), Constraint::Min(20)],
+    )
+    .header(Row::new(vec!["res", "size", "seeds", "source", "release"]).style(Style::default().fg(YELLOW).add_modifier(Modifier::BOLD)))
+    .block(block)
+    .highlight_style(if focused { highlight() } else { Style::default() })
+    .highlight_symbol("▶ ");
+    let mut state = TableState::default();
+    state.select(Some(d.stream_selected.min(list.len() - 1)));
+    f.render_stateful_widget(table, area, &mut state);
+}
+
+fn draw_tv(f: &mut Frame, area: Rect, app: &App) {
+    let block = |title: String| {
+        Block::default().borders(Borders::ALL).title(title).border_style(Style::default().fg(GRAY))
+    };
+
+    if app.tv_manage {
+        let title = format!(" playlists ({}) — a: add   x: remove   Esc: channels ", app.tv_playlists.len());
+        if app.tv_playlists.is_empty() {
+            return centered_message(f, area, block(title), "no playlists — press a to add an M3U URL or file path".into(), GRAY);
+        }
+        let items = app.tv_playlists.iter().map(|p| ListItem::new(p.clone())).collect();
+        return pane_list(f, area, title, items, app.tv_playlist_selected, true);
+    }
+
+    let show_filter = app.tv_filter_active || !app.tv_filter.is_empty();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(if show_filter { 1 } else { 0 }), Constraint::Min(3)])
+        .split(area);
+    if show_filter {
+        let mut spans = vec![
+            Span::styled("  / ", Style::default().fg(AQUA).add_modifier(Modifier::BOLD)),
+            Span::styled(app.tv_filter.clone(), Style::default().fg(if app.tv_filter_active { FG } else { YELLOW })),
+        ];
+        if app.tv_filter_active {
+            spans.push(Span::styled("█", Style::default().fg(AQUA)));
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)), chunks[0]);
+    }
+
+    let channels = app.tv_channels.lock().unwrap();
+    let (list, errors) = match &*channels {
+        Load::Idle | Load::Loading => {
+            return centered_message(f, chunks[1], block(" live TV ".into()), "loading playlists…".into(), YELLOW);
+        }
+        Load::Failed(e) => return centered_message(f, chunks[1], block(" live TV ".into()), format!("✗ {e}"), RED),
+        Load::Ready((list, errors)) => (list, errors),
+    };
+    if list.is_empty() {
+        let msg = if app.tv_playlists.is_empty() {
+            "no playlists yet — press a to add an M3U URL or file path".to_string()
+        } else {
+            format!("no channels loaded — {}", errors.join("; "))
+        };
+        return centered_message(f, chunks[1], block(" live TV ".into()), msg, GRAY);
+    }
+
+    let visible = crate::tv::filter(list, &app.tv_filter);
+    let mut title = format!(" live TV — {} channels ", visible.len());
+    if !errors.is_empty() {
+        title.push_str(&format!("· {} playlist(s) failed ", errors.len()));
+    }
+    // Build rows only for the window on screen: playlists can hold tens of thousands of channels.
+    let height = chunks[1].height.saturating_sub(3).max(1) as usize;
+    let selected = app.tv_selected.min(visible.len().saturating_sub(1));
+    let start = selected.saturating_sub(height - 1);
+    let rows: Vec<Row> = visible
+        .iter()
+        .skip(start)
+        .take(height)
+        .map(|c| {
+            Row::new(vec![
+                Cell::from(c.name.clone()),
+                Cell::from(c.group.clone()).style(Style::default().fg(GRAY)),
+            ])
+        })
+        .collect();
+    let table = Table::new(rows, [Constraint::Min(20), Constraint::Length(24)])
+        .header(Row::new(vec!["channel", "group"]).style(Style::default().fg(YELLOW).add_modifier(Modifier::BOLD)))
+        .block(block(title))
+        .highlight_style(highlight())
+        .highlight_symbol("▶ ");
+    let mut state = TableState::default();
+    if !visible.is_empty() {
+        state.select(Some(selected - start));
+    }
+    f.render_stateful_widget(table, chunks[1], &mut state);
+}
+
+fn draw_addons(f: &mut Frame, area: Rect, app: &App) {
+    let rows: Vec<Row> = app
+        .addons
+        .iter()
+        .map(|a| {
+            let (state, color) = if a.enabled { ("on", GREEN) } else { ("off", GRAY) };
+            let name = if a.is_core() { format!("{} (core)", a.name) } else { a.name.clone() };
+            Row::new(vec![
+                Cell::from(state).style(Style::default().fg(color)),
+                Cell::from(name),
+                Cell::from(a.capabilities()).style(Style::default().fg(AQUA)),
+                Cell::from(a.manifest_url.clone()).style(Style::default().fg(GRAY)),
+            ])
+        })
+        .collect();
+    let title = if app.addons.iter().any(|a| a.enabled && a.stream) {
+        format!(" addons ({}) ", app.addons.len())
+    } else {
+        format!(" addons ({}) — streams come from torrent search; a: add a stream addon for more ", app.addons.len())
+    };
+    let table = Table::new(
+        rows,
+        [Constraint::Length(4), Constraint::Length(24), Constraint::Length(30), Constraint::Min(20)],
+    )
+    .header(Row::new(vec!["", "name", "provides", "manifest"]).style(Style::default().fg(YELLOW).add_modifier(Modifier::BOLD)))
+    .block(Block::default().borders(Borders::ALL).title(title).border_style(Style::default().fg(GRAY)))
+    .highlight_style(highlight())
+    .highlight_symbol("▶ ");
+    let mut state = TableState::default();
+    if !app.addons.is_empty() {
+        state.select(Some(app.addon_selected.min(app.addons.len() - 1)));
+    }
+    f.render_stateful_widget(table, area, &mut state);
+}
+
+fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
+    let rows: Vec<Row> = app
+        .settings_rows()
+        .into_iter()
+        .map(|(label, value)| Row::new(vec![Cell::from(label).style(Style::default().fg(YELLOW)), Cell::from(value)]))
+        .collect();
+    let table = Table::new(rows, [Constraint::Length(18), Constraint::Min(20)])
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" settings — saved to {} ", crate::config::config_dir().join("config.json").display()))
+                .border_style(Style::default().fg(AQUA)),
+        )
+        .highlight_style(highlight())
+        .highlight_symbol("▶ ");
+    let mut state = TableState::default();
+    state.select(Some(app.settings_selected.min(App::SETTINGS_ROWS - 1)));
+    f.render_stateful_widget(table, area, &mut state);
+}
+
 fn draw_quit_popup(f: &mut Frame, area: Rect, app: &App) {
     let popup = centered_rect(62, 9, area);
     f.render_widget(Clear, popup);
@@ -547,7 +985,12 @@ fn draw_add_popup(f: &mut Frame, area: Rect, app: &App) {
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" add torrent — magnet link, URL, or local path ")
+            .title(match app.input_purpose {
+                InputPurpose::Torrent => " add torrent — magnet link, URL, or local path ",
+                InputPurpose::Playlist => " add M3U playlist — URL or file path ",
+                InputPurpose::Addon => " install Stremio addon — manifest URL ",
+                InputPurpose::DownloadDir => " download folder — leave empty for the default ",
+            })
             .border_style(Style::default().fg(YELLOW))
             .style(Style::default().bg(BG)),
     );

@@ -1,5 +1,11 @@
 use crate::history::{self, Kind as HistoryKind};
 use crate::omdb;
+use crate::commands::Command as SlashCommand;
+use crate::config::SearchSource;
+use crate::favorites;
+use crate::progress;
+use crate::stremio::{self, Addon, MetaItem, Source, Stream};
+use crate::tv;
 use crate::rqbit::{Client, FileDetails, TorrentStats};
 use crate::search::{self, SearchResult};
 use std::collections::{HashMap, HashSet};
@@ -11,6 +17,9 @@ use std::time::Duration;
 
 pub fn download_dir() -> std::path::PathBuf {
     if let Ok(dir) = std::env::var("TORFLIX_DOWNLOAD_DIR") {
+        return std::path::PathBuf::from(dir);
+    }
+    if let Some(dir) = crate::config::load().download_dir.filter(|d| !d.trim().is_empty()) {
         return std::path::PathBuf::from(dir);
     }
     dirs::download_dir()
@@ -46,6 +55,7 @@ pub fn is_video(name: &str) -> bool {
 pub struct TorrentRow {
     pub id: u64,
     pub name: String,
+    pub info_hash: String,
     pub stats: Option<TorrentStats>,
 }
 
@@ -59,6 +69,21 @@ pub enum View {
     ConfirmQuit,
     SearchResults,
     History,
+    /// Catalog list: search results, a /browse list, or favorites.
+    Discover,
+    Details,
+    Tv,
+    Addons,
+    Settings,
+}
+
+/// What the text-input popup is collecting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputPurpose {
+    Torrent,
+    Playlist,
+    Addon,
+    DownloadDir,
 }
 
 pub enum SearchStatus {
@@ -97,6 +122,86 @@ pub enum PreviewState {
     // (original_rqbit_index, file) — original index is needed for the stream URL
     Ready(Vec<(usize, crate::rqbit::FileDetails)>),
     Error(String),
+}
+
+/// Something fetched in the background.
+pub enum Load<T> {
+    Idle,
+    Loading,
+    Ready(T),
+    Failed(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pane {
+    Seasons,
+    Episodes,
+    Streams,
+}
+
+/// The title open in the details view.
+pub struct Details {
+    pub item: MetaItem,
+    pub meta: Arc<Mutex<Load<stremio::MetaDetail>>>,
+    pub pane: Pane,
+    pub season_idx: usize,
+    pub episode_idx: usize,
+    /// Streams for `streams_for`. Replaced rather than mutated when the episode
+    /// changes, so a slow reply for the previous episode can't land in the new list.
+    pub streams: Arc<Mutex<Load<(Vec<Stream>, Vec<String>)>>>,
+    pub streams_for: Option<(usize, usize)>,
+    pub stream_selected: usize,
+}
+
+/// Looks subtitles up right before playback, on the background thread.
+#[derive(Clone)]
+pub struct SubtitleQuery {
+    pub addons: Vec<Addon>,
+    pub kind: String,
+    pub id: String,
+    pub season: usize,
+    pub episode: usize,
+    pub lang: String,
+    pub release: String,
+}
+
+impl SubtitleQuery {
+    /// The best few subtitle URLs, most likely to be in sync first.
+    fn resolve(&self) -> Vec<String> {
+        if self.lang.is_empty() || self.lang.eq_ignore_ascii_case("off") {
+            return Vec::new();
+        }
+        let subs = stremio::subtitles(&self.addons, &self.kind, &self.id, self.season, self.episode);
+        stremio::rank_subtitles(&subs, &self.lang, Some(&self.release))
+            .into_iter()
+            .take(MAX_SUBTITLES)
+            .map(|s| s.url.clone())
+            .collect()
+    }
+
+    /// Start the lookup in the background; the caller waits for it with a timeout.
+    fn spawn(&self) -> std::sync::mpsc::Receiver<Vec<String>> {
+        let (tx, rx) = channel();
+        let query = self.clone();
+        thread::spawn(move || {
+            let _ = tx.send(query.resolve());
+        });
+        rx
+    }
+}
+
+/// How long playback may wait for subtitles once the video itself is ready.
+const SUBTITLE_WAIT: Duration = Duration::from_secs(4);
+
+/// Subtitles handed to mpv: the best first, the rest a keypress (j) away if it's off.
+const MAX_SUBTITLES: usize = 4;
+
+/// Optional extras when streaming a torrent.
+#[derive(Default)]
+pub struct StreamExtras {
+    /// Which file to play (a stream addon's fileIdx); otherwise the largest video.
+    pub file_idx: Option<usize>,
+    pub subtitles: Option<SubtitleQuery>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -174,6 +279,41 @@ pub struct App {
     pub keep_downloading: bool,
     /// View to go back to if the quit prompt is cancelled.
     pub quit_return_view: View,
+
+    pub config: crate::config::Config,
+    pub addons: Vec<Addon>,
+    pub favorites: Vec<favorites::Favorite>,
+
+    // Catalog list (catalog search, /browse, /favorites)
+    pub catalog: Arc<Mutex<Load<Vec<MetaItem>>>>,
+    pub catalog_title: String,
+    pub catalog_selected: usize,
+    /// Which /browse list is showing, if any.
+    pub browse_idx: Option<usize>,
+    pub details: Option<Details>,
+
+    // Text-input popup
+    pub input_purpose: InputPurpose,
+    /// View to return to when the popup closes.
+    pub input_return: View,
+
+    // Live TV
+    pub tv_channels: Arc<Mutex<Load<(Vec<tv::Channel>, Vec<String>)>>>,
+    pub tv_playlists: Vec<String>,
+    pub tv_filter: String,
+    pub tv_filter_active: bool,
+    pub tv_selected: usize,
+    /// Showing the playlist list instead of channels.
+    pub tv_manage: bool,
+    pub tv_playlist_selected: usize,
+
+    // Addons and settings
+    pub addon_selected: usize,
+    /// Filled by the background manifest fetch; picked up by `poll_background`.
+    pub installed_addon: Arc<Mutex<Option<Addon>>>,
+    pub settings_selected: usize,
+    /// Auto-detected player, looked up when settings open (probing runs a process).
+    pub detected_player: Option<String>,
 }
 
 impl App {
@@ -214,6 +354,27 @@ impl App {
             embedded: true,
             keep_downloading: false,
             quit_return_view: View::Home,
+            config: crate::config::load(),
+            addons: stremio::load_addons(),
+            favorites: favorites::load(),
+            catalog: Arc::new(Mutex::new(Load::Idle)),
+            catalog_title: String::new(),
+            catalog_selected: 0,
+            browse_idx: None,
+            details: None,
+            input_purpose: InputPurpose::Torrent,
+            input_return: View::Torrents,
+            tv_channels: Arc::new(Mutex::new(Load::Idle)),
+            tv_playlists: tv::load_config().playlists,
+            tv_filter: String::new(),
+            tv_filter_active: false,
+            tv_selected: 0,
+            tv_manage: false,
+            tv_playlist_selected: 0,
+            addon_selected: 0,
+            installed_addon: Arc::new(Mutex::new(None)),
+            settings_selected: 0,
+            detected_player: None,
         }
     }
 
@@ -231,6 +392,7 @@ impl App {
                         fresh.push(TorrentRow {
                             id: t.id,
                             name: t.name.unwrap_or_else(|| t.info_hash.clone()),
+                            info_hash: t.info_hash,
                             stats,
                         });
                     }
@@ -299,23 +461,30 @@ impl App {
             .unwrap_or(self.file_selected);
         let url = self.client.stream_url(self.files_torrent_id, stream_idx);
         let title = file.name.clone();
-        self.launch_player(&url, &title);
+        let hash = self
+            .rows_snapshot()
+            .into_iter()
+            .find(|r| r.id == self.files_torrent_id)
+            .map(|r| r.info_hash)
+            .unwrap_or_default();
+        let opts = PlayOpts::resuming(progress::torrent_key(&format!("magnet:?xt=urn:btih:{hash}"), stream_idx));
+        self.launch_player(&url, &title, &opts);
     }
 
     pub fn play_playlist(&mut self) {
         let url = self.client.playlist_url(self.files_torrent_id);
         let title = self.files_torrent_name.clone();
-        self.launch_player(&url, &title);
+        self.launch_player(&url, &title, &PlayOpts::default());
     }
 
-    fn launch_player(&mut self, url: &str, title: &str) {
+    fn launch_player(&mut self, url: &str, title: &str, opts: &PlayOpts) {
         let Some(player_cmd) = find_player() else {
             self.status =
                 "✗ no player found — install mpv or vlc, or set TORFLIX_PLAYER".into();
             return;
         };
-        match spawn_player(&player_cmd, url, title) {
-            Ok(_) => self.status = format!("▶ playing: {} — buffering may take a moment", title),
+        match spawn_player(&player_cmd, url, title, opts) {
+            Ok(_) => self.status = format!("▶ playing: {}{} — buffering may take a moment", title, opts.resume_note()),
             Err(e) => self.status = format!("✗ couldn't launch '{}': {}", player_cmd, e),
         }
     }
@@ -348,6 +517,11 @@ impl App {
 
     /// Add a torrent and either stream it (if a player is available) or download it permanently.
     pub fn add_and_play_async(&mut self, target: &str, label: &str) {
+        self.add_and_play_with(target, label, StreamExtras::default());
+    }
+
+    /// Like `add_and_play_async`, optionally choosing the file and fetching subtitles.
+    pub fn add_and_play_with(&mut self, target: &str, label: &str, extras: StreamExtras) {
         let client = self.client.clone();
         let tx = self.status_tx.clone();
         let target = target.to_string();
@@ -379,6 +553,8 @@ impl App {
         let stream_ids = Arc::clone(&self.stream_ids);
 
         thread::spawn(move || {
+            // Look subtitles up while the torrent's metadata resolves, not after.
+            let subtitles = extras.subtitles.as_ref().map(SubtitleQuery::spawn);
             // Unique temp dir so concurrent streams don't collide.
             let temp_dir = std::env::temp_dir().join(format!(
                 "torflix-{}",
@@ -415,12 +591,15 @@ impl App {
                 thread::sleep(Duration::from_millis(250));
             };
 
-            let best = details
-                .files
-                .iter()
-                .enumerate()
-                .filter(|(_, f)| is_video(&f.name))
-                .max_by_key(|(_, f)| f.length);
+            let requested = extras.file_idx.and_then(|i| details.files.get(i).map(|f| (i, f)));
+            let best = requested.or_else(|| {
+                details
+                    .files
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, f)| is_video(&f.name))
+                    .max_by_key(|(_, f)| f.length)
+            });
 
             let Some((idx, file)) = best else {
                 let _ = tx.send(format!(
@@ -434,12 +613,19 @@ impl App {
             client.update_only_files(id, &[idx]).ok();
             let url = client.stream_url(id, idx);
             let title = file.name.clone();
+            let mut opts = PlayOpts::resuming(progress::torrent_key(&target, idx));
+            if let Some(pending) = &subtitles {
+                let _ = tx.send("⧗ looking for subtitles…".into());
+                opts.subtitles = pending.recv_timeout(SUBTITLE_WAIT).unwrap_or_default();
+            }
 
-            match spawn_player(&player_cmd, &url, &title) {
+            match spawn_player(&player_cmd, &url, &title, &opts) {
                 Ok(mut child) => {
                     let _ = tx.send(format!(
-                        "▶ streaming: {}  [tmp: {}]",
+                        "▶ streaming: {}{}{}  [tmp: {}]",
                         title,
+                        opts.resume_note(),
+                        subtitle_note(&opts),
                         temp_dir.display()
                     ));
                     child.wait().ok();
@@ -464,12 +650,22 @@ impl App {
     pub fn submit_add(&mut self) {
         let input = self.input.trim().to_string();
         self.input.clear();
-        self.view = View::Torrents;
-        if input.is_empty() {
-            return;
+        self.view = self.input_return.clone();
+        match self.input_purpose {
+            InputPurpose::Torrent => {
+                if !input.is_empty() {
+                    let label = snip_label(&input);
+                    self.add_and_play_async(&input, &label);
+                }
+            }
+            InputPurpose::Playlist => self.add_playlist(input),
+            InputPurpose::Addon => self.install_addon(input),
+            InputPurpose::DownloadDir => {
+                self.config.download_dir = (!input.is_empty()).then_some(input);
+                crate::config::save(&self.config);
+                self.status = format!("downloads go to {}", download_dir().display());
+            }
         }
-        let label = snip_label(&input);
-        self.add_and_play_async(&input, &label);
     }
 
     // ---------- search ----------
@@ -545,13 +741,14 @@ impl App {
         match r.add_target() {
             Some(target) => {
                 let target = target.to_string();
-                self.download_to_disk_async(&target, &r.title);
+                self.download_to_disk_async(&target, &r.title, None);
             }
             None => self.status = "✗ result has no magnet or download link".into(),
         }
     }
 
-    fn download_to_disk_async(&mut self, target: &str, label: &str) {
+    /// Download permanently; `file_idx` limits it to one file of a multi-file torrent.
+    fn download_to_disk_async(&mut self, target: &str, label: &str, file_idx: Option<usize>) {
         let client = self.client.clone();
         let tx = self.status_tx.clone();
         let target = target.to_string();
@@ -562,7 +759,10 @@ impl App {
         thread::spawn(move || {
             std::fs::create_dir_all(&dest).ok();
             match client.add_to_dir(&target, &dest) {
-                Ok(_) => {
+                Ok(id) => {
+                    if let Some(idx) = file_idx {
+                        client.update_only_files(id, &[idx]).ok();
+                    }
                     let _ = tx.send(format!("⬇ downloading: {}  →  {}", label, dest.display()));
                 }
                 Err(e) => {
@@ -801,10 +1001,11 @@ impl App {
         let tx = self.status_tx.clone();
         let stream_ids = Arc::clone(&self.stream_ids);
         let title = file_name.clone();
+        let opts = PlayOpts::resuming(progress::torrent_key(&preview.target, file_idx));
 
-        match spawn_player(&player_cmd, &url, &title) {
+        match spawn_player(&player_cmd, &url, &title, &opts) {
             Ok(mut child) => {
-                self.status = format!("▶ streaming: {}", title);
+                self.status = format!("▶ streaming: {}{}", title, opts.resume_note());
                 thread::spawn(move || {
                     child.wait().ok();
                     client.forget(id).ok();
@@ -843,9 +1044,665 @@ impl App {
         if let Some(r) = result {
             if let Some(target) = r.add_target() {
                 let target = target.to_string();
-                self.download_to_disk_async(&target, &r.title);
+                self.download_to_disk_async(&target, &r.title, None);
             }
         }
+    }
+
+    // ---------- catalog (Stremio addons) ----------
+
+    pub fn toggle_search_source(&mut self) {
+        self.config.search_source = self.config.search_source.toggle();
+        crate::config::save(&self.config);
+        self.status = format!("search box now searches: {}", self.config.search_source.label());
+    }
+
+    /// Enter on the home screen: a slash command, or a search in the chosen source.
+    pub fn submit_home(&mut self) {
+        let q = self.search_query.trim().to_string();
+        if q.starts_with('/') {
+            self.run_command(&q);
+        } else if self.config.search_source == SearchSource::Catalog {
+            self.start_catalog_search();
+        } else {
+            self.start_search();
+        }
+    }
+
+    pub fn run_command(&mut self, input: &str) {
+        self.search_query.clear();
+        match SlashCommand::parse(input) {
+            Some(SlashCommand::Browse) => self.open_browse(0),
+            Some(SlashCommand::Favorites) => self.open_favorites(),
+            Some(SlashCommand::History) => self.open_history(),
+            Some(SlashCommand::Downloads) => self.view = View::Torrents,
+            Some(SlashCommand::Help) => self.show_help = true,
+            Some(SlashCommand::Quit) => self.request_quit(),
+            Some(SlashCommand::Tv) => self.open_tv(),
+            Some(SlashCommand::Addons) => self.open_addons(),
+            Some(SlashCommand::Settings) => self.open_settings(),
+            None => self.status = format!("✗ unknown command '{input}' — type / to see them"),
+        }
+    }
+
+    fn load_catalog(
+        &mut self,
+        title: String,
+        job: impl FnOnce() -> anyhow::Result<Vec<MetaItem>> + Send + 'static,
+    ) {
+        let slot = Arc::new(Mutex::new(Load::Loading));
+        self.catalog = Arc::clone(&slot);
+        self.catalog_title = title;
+        self.catalog_selected = 0;
+        self.view = View::Discover;
+        thread::spawn(move || {
+            let result = match job() {
+                Ok(items) => Load::Ready(items),
+                Err(e) => Load::Failed(format!("{e:#}")),
+            };
+            *slot.lock().unwrap() = result;
+        });
+    }
+
+    pub fn start_catalog_search(&mut self) {
+        let q = self.search_query.trim().to_string();
+        if q.is_empty() {
+            return;
+        }
+        self.browse_idx = None;
+        let addons = self.addons.clone();
+        self.load_catalog(format!("catalog — '{q}'"), move || stremio::search(&addons, &q));
+    }
+
+    /// Show one of the /browse lists.
+    pub fn open_browse(&mut self, which: usize) {
+        let targets = stremio::browse_targets(&self.addons);
+        if targets.is_empty() {
+            self.status = "✗ enable Cinemeta in /addons to browse".into();
+            return;
+        }
+        let which = which % targets.len();
+        self.browse_idx = Some(which);
+        let target = targets[which].clone();
+        self.load_catalog(target.label.to_string(), move || stremio::catalog(&target));
+    }
+
+    /// `b` in a /browse list: the next list.
+    pub fn next_browse(&mut self) {
+        if let Some(i) = self.browse_idx {
+            self.open_browse(i + 1);
+        }
+    }
+
+    pub fn open_favorites(&mut self) {
+        self.favorites = favorites::load();
+        let items = self
+            .favorites
+            .iter()
+            .map(|f| MetaItem {
+                id: f.id.clone(),
+                kind: f.kind.clone(),
+                name: f.name.clone(),
+                poster: None,
+                release_info: (!f.year.is_empty()).then(|| f.year.clone()),
+                imdb_rating: None,
+                genres: Vec::new(),
+                description: None,
+            })
+            .collect();
+        self.browse_idx = None;
+        self.catalog = Arc::new(Mutex::new(Load::Ready(items)));
+        self.catalog_title = "favorites".into();
+        self.catalog_selected = 0;
+        self.view = View::Discover;
+    }
+
+    pub fn catalog_len(&self) -> usize {
+        match &*self.catalog.lock().unwrap() {
+            Load::Ready(v) => v.len(),
+            _ => 0,
+        }
+    }
+
+    fn selected_catalog_item(&self) -> Option<MetaItem> {
+        match &*self.catalog.lock().unwrap() {
+            Load::Ready(v) => v.get(self.catalog_selected).cloned(),
+            _ => None,
+        }
+    }
+
+    pub fn open_details(&mut self) {
+        if let Some(item) = self.selected_catalog_item() {
+            self.open_details_for(item);
+        }
+    }
+
+    fn open_details_for(&mut self, item: MetaItem) {
+        let meta = Arc::new(Mutex::new(Load::Loading));
+        let (slot, addons, kind, id) = (Arc::clone(&meta), self.addons.clone(), item.kind.clone(), item.id.clone());
+        thread::spawn(move || {
+            let result = match stremio::meta(&addons, &kind, &id) {
+                Ok(m) => Load::Ready(m),
+                Err(e) => Load::Failed(format!("{e:#}")),
+            };
+            *slot.lock().unwrap() = result;
+        });
+        let series = item.is_series();
+        self.details = Some(Details {
+            item,
+            meta,
+            pane: if series { Pane::Seasons } else { Pane::Streams },
+            season_idx: 0,
+            episode_idx: 0,
+            streams: Arc::new(Mutex::new(Load::Idle)),
+            streams_for: None,
+            stream_selected: 0,
+        });
+        self.view = View::Details;
+        if !series {
+            self.load_streams(0, 0);
+        }
+    }
+
+    /// Seasons of the open series; empty until its details load, and for movies.
+    pub fn details_seasons(&self) -> Vec<stremio::Season> {
+        let Some(d) = self.details.as_ref() else {
+            return Vec::new();
+        };
+        let meta = d.meta.lock().unwrap();
+        match &*meta {
+            Load::Ready(m) => m.seasons(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn load_streams(&mut self, season: usize, episode: usize) {
+        let addons = self.addons.clone();
+        let Some(d) = self.details.as_mut() else { return };
+        if d.streams_for == Some((season, episode)) {
+            return;
+        }
+        let slot = Arc::new(Mutex::new(Load::Loading));
+        d.streams = Arc::clone(&slot);
+        d.streams_for = Some((season, episode));
+        d.stream_selected = 0;
+        let (kind, id) = (d.item.kind.clone(), d.item.id.clone());
+        let query = indexer_query(&d.item, season, episode);
+        let name = d.item.name.clone();
+        let year = d.item.year_label();
+        thread::spawn(move || {
+            let (mut streams, mut errors) = stremio::streams(&addons, &kind, &id, season, episode);
+            // No stream addon, or nothing from it: use torflix's own torrent search.
+            if streams.is_empty() {
+                let backend = search::backend_from_env().expect("backend_from_env always returns Some");
+                let partial = Arc::new(Mutex::new(Vec::new()));
+                match search::search(&backend, &query, &partial) {
+                    Ok(results) => streams = streams_from_results(results, &name, &year, season, episode),
+                    Err(e) => errors.push(format!("torrent search: {e:#}")),
+                }
+                if streams.is_empty() && errors.is_empty() {
+                    errors.push(format!("no torrents found for '{query}' — press t for a broader search"));
+                }
+            }
+            let result = if streams.is_empty() && !errors.is_empty() {
+                Load::Failed(errors.join("; "))
+            } else {
+                Load::Ready((streams, errors))
+            };
+            *slot.lock().unwrap() = result;
+        });
+    }
+
+    fn stream_count(&self) -> usize {
+        let Some(d) = self.details.as_ref() else { return 0 };
+        let streams = d.streams.lock().unwrap();
+        match &*streams {
+            Load::Ready((s, _)) => s.len(),
+            _ => 0,
+        }
+    }
+
+    pub fn details_move(&mut self, down: bool) {
+        let seasons = self.details_seasons();
+        let streams = self.stream_count();
+        let Some(d) = self.details.as_mut() else { return };
+        let step = |i: usize, len: usize| {
+            if len == 0 {
+                0
+            } else if down {
+                (i + 1).min(len - 1)
+            } else {
+                i.saturating_sub(1)
+            }
+        };
+        match d.pane {
+            Pane::Seasons => {
+                let next = step(d.season_idx, seasons.len());
+                if next != d.season_idx {
+                    d.season_idx = next;
+                    d.episode_idx = 0;
+                }
+            }
+            Pane::Episodes => {
+                let len = seasons.get(d.season_idx).map_or(0, |s| s.episodes.len());
+                d.episode_idx = step(d.episode_idx, len);
+            }
+            Pane::Streams => d.stream_selected = step(d.stream_selected, streams),
+        }
+    }
+
+    /// Tab / Shift+Tab. Series go seasons → episodes → streams; movies only have streams.
+    pub fn details_pane(&mut self, forward: bool) {
+        let Some(d) = self.details.as_mut() else { return };
+        if !d.item.is_series() {
+            return;
+        }
+        d.pane = match (d.pane, forward) {
+            (Pane::Seasons, true) => Pane::Episodes,
+            (Pane::Episodes, true) if d.streams_for.is_some() => Pane::Streams,
+            (Pane::Episodes, false) => Pane::Seasons,
+            (Pane::Streams, false) => Pane::Episodes,
+            (pane, _) => pane,
+        };
+    }
+
+    pub fn details_enter(&mut self) {
+        let Some(pane) = self.details.as_ref().map(|d| d.pane) else { return };
+        match pane {
+            Pane::Seasons => self.details_pane(true),
+            Pane::Episodes => {
+                if let Some(ep) = self.current_episode() {
+                    self.load_streams(ep.season, ep.number);
+                    if let Some(d) = self.details.as_mut() {
+                        d.pane = Pane::Streams;
+                    }
+                }
+            }
+            Pane::Streams => self.play_selected_stream(),
+        }
+    }
+
+    /// Esc: back a pane, then out to the list.
+    pub fn details_back(&mut self) {
+        let series = self.details.as_ref().map_or(false, |d| d.item.is_series());
+        match self.details.as_ref().map(|d| d.pane) {
+            Some(Pane::Streams) | Some(Pane::Episodes) if series => self.details_pane(false),
+            _ => {
+                self.details = None;
+                self.view = View::Discover;
+            }
+        }
+    }
+
+    pub fn current_episode(&self) -> Option<stremio::Episode> {
+        let d = self.details.as_ref()?;
+        let seasons = self.details_seasons();
+        seasons.get(d.season_idx)?.episodes.get(d.episode_idx).cloned()
+    }
+
+    /// "Breaking Bad S01E02 · Cat's in the Bag..." or "Inception (2010)".
+    fn playing_label(&self) -> Option<String> {
+        let d = self.details.as_ref()?;
+        let (s, e) = d.streams_for?;
+        if d.item.is_series() && e > 0 {
+            let title = self
+                .details_seasons()
+                .iter()
+                .find(|x| x.number == s)
+                .and_then(|x| x.episodes.iter().find(|ep| ep.number == e))
+                .map(|ep| ep.title.clone())
+                .filter(|t| !t.is_empty());
+            Some(match title {
+                Some(t) => format!("{} S{s:02}E{e:02} · {t}", d.item.name),
+                None => format!("{} S{s:02}E{e:02}", d.item.name),
+            })
+        } else {
+            let year = d.item.year_label();
+            Some(if year.is_empty() { d.item.name.clone() } else { format!("{} ({year})", d.item.name) })
+        }
+    }
+
+    fn selected_stream(&self) -> Option<(Stream, String, SubtitleQuery)> {
+        let d = self.details.as_ref()?;
+        let stream = {
+            let streams = d.streams.lock().unwrap();
+            match &*streams {
+                Load::Ready((s, _)) => s.get(d.stream_selected).cloned(),
+                _ => None,
+            }
+        }?;
+        let (season, episode) = d.streams_for?;
+        let subs = SubtitleQuery {
+            addons: self.addons.clone(),
+            kind: d.item.kind.clone(),
+            id: d.item.id.clone(),
+            season,
+            episode,
+            lang: self.config.subtitle_lang.clone(),
+            release: stream.release.clone(),
+        };
+        Some((stream, self.playing_label()?, subs))
+    }
+
+    pub fn play_selected_stream(&mut self) {
+        let Some((stream, label, subs)) = self.selected_stream() else { return };
+        match &stream.source {
+            Source::Torrent { .. } => self.add_and_play_with(
+                &stream.target(),
+                &label,
+                StreamExtras { file_idx: stream.file_idx(), subtitles: Some(subs) },
+            ),
+            Source::Http { .. } => self.play_http(stream, label, subs),
+        }
+    }
+
+    fn play_http(&mut self, stream: Stream, label: String, subs: SubtitleQuery) {
+        let Some(player_cmd) = find_player() else {
+            self.status = "✗ no player found — install mpv or vlc".into();
+            return;
+        };
+        let url = stream.target();
+        history::record(&label, &url, HistoryKind::Stream, None);
+        self.status = format!("⧗ opening: {label}");
+        let tx = self.status_tx.clone();
+        let headers = stream.headers().to_vec();
+        let pending = subs.spawn();
+        thread::spawn(move || {
+            let mut opts = PlayOpts::resuming(progress::url_key(&url));
+            opts.headers = headers;
+            opts.subtitles = pending.recv_timeout(SUBTITLE_WAIT).unwrap_or_default();
+            match spawn_player(&player_cmd, &url, &label, &opts) {
+                Ok(mut child) => {
+                    let _ = tx.send(format!("▶ playing: {label}{}{}", opts.resume_note(), subtitle_note(&opts)));
+                    child.wait().ok();
+                    let _ = tx.send(format!("✓ done: {label}"));
+                }
+                Err(e) => {
+                    let _ = tx.send(format!("✗ couldn't launch '{player_cmd}': {e}"));
+                }
+            }
+        });
+    }
+
+    pub fn download_selected_stream(&mut self) {
+        let Some((stream, label, _)) = self.selected_stream() else { return };
+        if stream.is_torrent() {
+            self.download_to_disk_async(&stream.target(), &label, stream.file_idx());
+        } else {
+            self.status = "✗ only torrent streams can be downloaded".into();
+        }
+    }
+
+    /// `t` in details: fall back to the torrent indexers for what's open.
+    pub fn search_torrents_for_details(&mut self) {
+        let Some(d) = self.details.as_ref() else { return };
+        let q = match (d.item.is_series(), self.current_episode()) {
+            (true, Some(ep)) => format!("{} S{:02}E{:02}", d.item.name, ep.season, ep.number),
+            _ => format!("{} {}", d.item.name, d.item.year_label()),
+        };
+        self.search_query = q.trim().to_string();
+        self.start_search();
+    }
+
+    pub fn toggle_favorite(&mut self) {
+        let item = match self.view {
+            View::Details => self.details.as_ref().map(|d| d.item.clone()),
+            _ => self.selected_catalog_item(),
+        };
+        let Some(item) = item else { return };
+        let fav = favorites::Favorite {
+            id: item.id.clone(),
+            kind: item.kind.clone(),
+            name: item.name.clone(),
+            year: item.year_label(),
+            added_at: history::now(),
+        };
+        let starred = favorites::toggle(&mut self.favorites, fav);
+        favorites::save(&self.favorites);
+        self.status = if starred {
+            format!("★ starred {}", item.name)
+        } else {
+            format!("☆ unstarred {}", item.name)
+        };
+    }
+
+    pub fn is_favorite(&self, id: &str) -> bool {
+        favorites::is_favorite(&self.favorites, id)
+    }
+
+    // ---------- text input ----------
+
+    pub fn open_input(&mut self, purpose: InputPurpose) {
+        self.input = match purpose {
+            InputPurpose::DownloadDir => self.config.download_dir.clone().unwrap_or_default(),
+            _ => String::new(),
+        };
+        self.input_purpose = purpose;
+        if self.view != View::AddInput {
+            self.input_return = self.view.clone();
+        }
+        self.view = View::AddInput;
+    }
+
+    pub fn cancel_input(&mut self) {
+        self.input.clear();
+        self.view = self.input_return.clone();
+    }
+
+    // ---------- live TV ----------
+
+    pub fn open_tv(&mut self) {
+        self.view = View::Tv;
+        if matches!(*self.tv_channels.lock().unwrap(), Load::Idle) {
+            self.reload_tv();
+        }
+    }
+
+    pub fn reload_tv(&mut self) {
+        let playlists = tv::load_config().playlists;
+        self.tv_playlists = playlists.clone();
+        self.tv_selected = 0;
+        if playlists.is_empty() {
+            self.tv_channels = Arc::new(Mutex::new(Load::Ready((Vec::new(), Vec::new()))));
+            return;
+        }
+        let slot = Arc::new(Mutex::new(Load::Loading));
+        self.tv_channels = Arc::clone(&slot);
+        thread::spawn(move || {
+            let loaded = tv::load_all(&playlists);
+            *slot.lock().unwrap() = Load::Ready(loaded);
+        });
+    }
+
+    pub fn tv_visible_len(&self) -> usize {
+        match &*self.tv_channels.lock().unwrap() {
+            Load::Ready((channels, _)) => tv::filter(channels, &self.tv_filter).len(),
+            _ => 0,
+        }
+    }
+
+    pub fn play_channel(&mut self) {
+        let channel = match &*self.tv_channels.lock().unwrap() {
+            Load::Ready((channels, _)) => tv::filter(channels, &self.tv_filter)
+                .get(self.tv_selected)
+                .map(|c| (*c).clone()),
+            _ => None,
+        };
+        let Some(channel) = channel else { return };
+        let Some(player_cmd) = find_player() else {
+            self.status = "✗ no player found — install mpv or vlc".into();
+            return;
+        };
+        match spawn_player(&player_cmd, &channel.url, &channel.name, &PlayOpts::default()) {
+            Ok(mut child) => {
+                self.status = format!("▶ live: {}", channel.name);
+                thread::spawn(move || {
+                    child.wait().ok();
+                });
+            }
+            Err(e) => self.status = format!("✗ couldn't launch '{player_cmd}': {e}"),
+        }
+    }
+
+    fn add_playlist(&mut self, source: String) {
+        if source.is_empty() {
+            return;
+        }
+        let mut cfg = tv::load_config();
+        if !cfg.playlists.contains(&source) {
+            cfg.playlists.push(source.clone());
+            tv::save_config(&cfg);
+        }
+        self.status = format!("⧗ loading playlist {source}");
+        self.reload_tv();
+    }
+
+    pub fn remove_playlist(&mut self) {
+        let mut cfg = tv::load_config();
+        if self.tv_playlist_selected >= cfg.playlists.len() {
+            return;
+        }
+        let removed = cfg.playlists.remove(self.tv_playlist_selected);
+        tv::save_config(&cfg);
+        self.tv_playlist_selected = self.tv_playlist_selected.min(cfg.playlists.len().saturating_sub(1));
+        self.status = format!("removed playlist {removed}");
+        self.reload_tv();
+    }
+
+    // ---------- addons ----------
+
+    pub fn open_addons(&mut self) {
+        self.addons = stremio::load_addons();
+        self.addon_selected = self.addon_selected.min(self.addons.len().saturating_sub(1));
+        self.view = View::Addons;
+    }
+
+    fn install_addon(&mut self, url: String) {
+        if url.is_empty() {
+            return;
+        }
+        self.status = "⧗ fetching addon manifest…".into();
+        let (slot, tx) = (Arc::clone(&self.installed_addon), self.status_tx.clone());
+        thread::spawn(move || match stremio::fetch_addon(&url) {
+            Ok(addon) => *slot.lock().unwrap() = Some(addon),
+            Err(e) => {
+                let _ = tx.send(format!("✗ couldn't install addon: {e:#}"));
+            }
+        });
+    }
+
+    /// Apply results of background work that change app state, not just the status line.
+    pub fn poll_background(&mut self) {
+        let installed = self.installed_addon.lock().unwrap().take();
+        if let Some(addon) = installed {
+            let (name, caps) = (addon.name.clone(), addon.capabilities());
+            match self.addons.iter().position(|a| a.manifest_url == addon.manifest_url) {
+                Some(i) => self.addons[i] = addon,
+                None => self.addons.push(addon),
+            }
+            stremio::save_addons(&self.addons);
+            self.status = if caps.is_empty() {
+                format!("⚠ installed {name}, but it offers nothing torflix uses")
+            } else {
+                format!("✓ installed {name} — {caps}")
+            };
+        }
+    }
+
+    pub fn toggle_addon(&mut self) {
+        let Some(addon) = self.addons.get_mut(self.addon_selected) else { return };
+        if addon.is_core() {
+            self.status = "Cinemeta powers search and details, so it stays on".into();
+            return;
+        }
+        addon.enabled = !addon.enabled;
+        let msg = format!("{} {}", addon.name, if addon.enabled { "enabled" } else { "disabled" });
+        stremio::save_addons(&self.addons);
+        self.status = msg;
+    }
+
+    pub fn remove_addon(&mut self) {
+        let Some(addon) = self.addons.get(self.addon_selected) else { return };
+        if addon.is_core() {
+            self.status = "Cinemeta can't be removed".into();
+            return;
+        }
+        let removed = self.addons.remove(self.addon_selected);
+        stremio::save_addons(&self.addons);
+        self.addon_selected = self.addon_selected.min(self.addons.len().saturating_sub(1));
+        self.status = format!("removed {}", removed.name);
+    }
+
+    // ---------- settings ----------
+
+    pub const SETTINGS_ROWS: usize = 5;
+
+    pub fn open_settings(&mut self) {
+        self.detected_player = player_candidates().into_iter().find(|c| player_exists(c));
+        self.view = View::Settings;
+    }
+
+    /// (label, value) rows for the settings screen.
+    pub fn settings_rows(&self) -> Vec<(&'static str, String)> {
+        let env_player = std::env::var("TORFLIX_PLAYER").ok().filter(|p| !p.trim().is_empty());
+        let player = match (env_player, &self.config.player) {
+            (Some(env), _) => format!("{env}  (set by TORFLIX_PLAYER)"),
+            (None, Some(p)) => p.clone(),
+            (None, None) => format!("auto — {}", self.detected_player.as_deref().unwrap_or("none found")),
+        };
+        let lang = &self.config.subtitle_lang;
+        let subtitles = if lang.eq_ignore_ascii_case("off") {
+            "off".to_string()
+        } else {
+            format!("{} ({lang})", crate::config::subtitle_lang_label(lang))
+        };
+        vec![
+            ("search box", self.config.search_source.label().to_string()),
+            ("player", player),
+            ("subtitles", subtitles),
+            ("download folder", download_dir().display().to_string()),
+            (
+                "addons",
+                format!(
+                    "{} installed, {} enabled",
+                    self.addons.len(),
+                    self.addons.iter().filter(|a| a.enabled).count()
+                ),
+            ),
+        ]
+    }
+
+    /// Enter / → / ←: change the selected setting.
+    pub fn settings_change(&mut self, forward: bool) {
+        match self.settings_selected {
+            0 => self.config.search_source = self.config.search_source.toggle(),
+            1 => {
+                let options: [Option<&str>; 3] = [None, Some("mpv"), Some("vlc")];
+                let current = options
+                    .iter()
+                    .position(|o| *o == self.config.player.as_deref())
+                    .unwrap_or(0);
+                let next = if forward { (current + 1) % 3 } else { (current + 2) % 3 };
+                self.config.player = options[next].map(str::to_string);
+            }
+            2 => {
+                let langs = crate::config::SUBTITLE_LANGS;
+                let current = langs
+                    .iter()
+                    .position(|(code, _)| code.eq_ignore_ascii_case(&self.config.subtitle_lang))
+                    .unwrap_or(0);
+                let next = if forward {
+                    (current + 1) % langs.len()
+                } else {
+                    (current + langs.len() - 1) % langs.len()
+                };
+                self.config.subtitle_lang = langs[next].0.to_string();
+            }
+            3 => return self.open_input(InputPurpose::DownloadDir),
+            4 => return self.open_addons(),
+            _ => return,
+        }
+        crate::config::save(&self.config);
     }
 
     // ---------- quitting ----------
@@ -899,7 +1756,7 @@ impl App {
 
     pub fn history_download(&mut self) {
         let Some(e) = self.selected_history() else { return };
-        self.download_to_disk_async(&e.target, &e.title);
+        self.download_to_disk_async(&e.target, &e.title, None);
         self.history = history::load();
         self.history_selected = 0;
     }
@@ -1005,6 +1862,9 @@ pub fn find_player() -> Option<String> {
             return Some(p);
         }
     }
+    if let Some(p) = crate::config::load().player.filter(|p| !p.trim().is_empty()) {
+        return Some(p.trim().to_string());
+    }
     player_candidates().into_iter().find(|c| player_exists(c))
 }
 
@@ -1107,9 +1967,157 @@ fn warm_stream(url: &str) {
     });
 }
 
-/// Spawns the media player with an appropriate title flag.
-fn spawn_player(player_cmd: &str, url: &str, title: &str) -> std::io::Result<std::process::Child> {
-    warm_stream(url);
+/// Extras for a playback: where to resume, subtitles, and HTTP headers the source needs.
+#[derive(Debug, Clone, Default)]
+pub struct PlayOpts {
+    /// Seconds to start from.
+    pub start: Option<u64>,
+    /// Subtitle URLs or paths, best first.
+    pub subtitles: Vec<String>,
+    pub headers: Vec<(String, String)>,
+    /// Progress key: mpv records the position under it.
+    pub track_key: Option<String>,
+}
+
+impl PlayOpts {
+    /// Track progress under `key`, starting from wherever it was left.
+    pub fn resuming(key: String) -> Self {
+        Self {
+            start: progress::resume_at(&key),
+            track_key: Some(key),
+            ..Self::default()
+        }
+    }
+
+    pub fn resume_note(&self) -> String {
+        match self.start {
+            Some(s) => format!(" (resuming at {})", format_clock(s)),
+            None => String::new(),
+        }
+    }
+}
+
+/// What to ask the torrent indexers for: "The Office S01E03" or "Inception 2010".
+fn indexer_query(item: &MetaItem, season: usize, episode: usize) -> String {
+    if item.is_series() && episode > 0 {
+        format!("{} S{season:02}E{episode:02}", item.name)
+    } else {
+        format!("{} {}", item.name, item.year_label()).trim().to_string()
+    }
+}
+
+fn normalize_title(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Is `release` for this title? It has to start with the name, and whatever sits
+/// between the name and the episode tag can only be the show's year or a country
+/// code — so "The Office US S01E03" passes but "The Office Movers S01E03" and the
+/// 2024 "The Office" don't. For movies, the word after the name must be the year.
+fn title_matches(release: &str, name: &str, year: &str, series: bool) -> bool {
+    const COUNTRIES: &[&str] = &["us", "uk", "au", "ca", "nz"];
+    let name = normalize_title(name);
+    let release = normalize_title(release);
+    let name_words: Vec<&str> = name.split(' ').collect();
+    let words: Vec<&str> = release.split(' ').collect();
+    if name.is_empty() || words.len() <= name_words.len() || words[..name_words.len()] != name_words[..] {
+        return false;
+    }
+    let year: Option<i32> = year.get(..4).and_then(|y| y.parse().ok());
+    let is_year = |w: &str| w.len() == 4 && w.chars().all(|c| c.is_ascii_digit());
+    // Release years are often off by one from the catalog's.
+    let right_year = |w: &str| match (year, w.parse::<i32>()) {
+        (Some(want), Ok(got)) => (want - got).abs() <= 1,
+        _ => true,
+    };
+    let rest = &words[name_words.len()..];
+    if series {
+        for w in rest {
+            if stremio::parse_season_episode(w).is_some() {
+                return true;
+            }
+            if !(COUNTRIES.contains(w) || (is_year(w) && right_year(w))) {
+                return false;
+            }
+        }
+        false
+    } else {
+        matches!(rest.first(), Some(w) if is_year(w) && right_year(w))
+    }
+}
+
+/// Indexer results for a catalog title, as streams. Episodes keep only exact
+/// SxxEyy releases: a season pack would need the right file picked out of it.
+fn streams_from_results(results: Vec<SearchResult>, name: &str, year: &str, season: usize, episode: usize) -> Vec<Stream> {
+    let mut streams: Vec<Stream> = results
+        .into_iter()
+        .filter_map(|r| {
+            let info_hash = progress::info_hash_of(r.magnet.as_deref()?)?;
+            if !title_matches(&r.title, name, year, episode > 0) {
+                return None;
+            }
+            if episode > 0 && stremio::parse_season_episode(&r.title) != Some((season, episode)) {
+                return None;
+            }
+            Some(Stream {
+                addon: "torrent search".into(),
+                source: Source::Torrent { info_hash, file_idx: None, trackers: Vec::new() },
+                quality: stremio::parse_quality(&r.title),
+                codec: stremio::parse_codec(&r.title),
+                languages: stremio::parse_audio_tracks(&r.title),
+                size: (r.size > 0).then_some(r.size),
+                seeders: u64::try_from(r.seeders).ok(),
+                origin: Some(r.indexer.clone()),
+                release: r.title,
+            })
+        })
+        .collect();
+    stremio::rank(&mut streams);
+    streams
+}
+
+fn subtitle_note(opts: &PlayOpts) -> String {
+    match opts.subtitles.len() {
+        0 => String::new(),
+        1 => " + subtitles (z/x in mpv to shift timing)".to_string(),
+        n => format!(" + {n} subtitles (j in mpv for the next if out of sync, z/x to shift)"),
+    }
+}
+
+pub fn format_clock(secs: u64) -> String {
+    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
+/// VLC can't fetch subtitles itself, so download them next to the temp streams.
+fn local_subtitle(url: &str) -> Option<String> {
+    if !url.starts_with("http") {
+        return Some(url.to_string());
+    }
+    let resp = minreq::get(url).with_timeout(15).send().ok()?;
+    if resp.status_code >= 400 {
+        return None;
+    }
+    let path = std::env::temp_dir().join(format!("torflix-sub-{:016x}.srt", crate::config::stable_hash(url)));
+    std::fs::write(&path, resp.as_bytes()).ok()?;
+    Some(path.display().to_string())
+}
+
+/// Spawns the media player with title, resume, subtitle and header flags.
+fn spawn_player(player_cmd: &str, url: &str, title: &str, opts: &PlayOpts) -> std::io::Result<std::process::Child> {
+    // Only rqbit streams benefit from pre-fetching; other hosts may need headers.
+    if url.contains("/torrents/") && url.contains("/stream/") {
+        warm_stream(url);
+    }
 
     let mut parts = player_cmd.split_whitespace();
     let bin = parts.next().unwrap_or("mpv");
@@ -1120,7 +2128,43 @@ fn spawn_player(player_cmd: &str, url: &str, title: &str) -> std::io::Result<std
     let bin_lc = bin.to_lowercase();
     if bin_lc.contains("mpv") {
         cmd.arg(format!("--force-media-title={}", title));
+        if let Some(start) = opts.start {
+            cmd.arg(format!("--start={start}"));
+        }
+        for sub in &opts.subtitles {
+            cmd.arg(format!("--sub-file={sub}"));
+        }
+        if let Some(key) = &opts.track_key {
+            cmd.args(progress::mpv_tracking_args(key));
+        }
+        let mut fields = Vec::new();
+        for (name, value) in &opts.headers {
+            if name.eq_ignore_ascii_case("user-agent") {
+                cmd.arg(format!("--user-agent={value}"));
+            } else if name.eq_ignore_ascii_case("referer") {
+                cmd.arg(format!("--referrer={value}"));
+            } else {
+                fields.push(format!("{name}: {value}"));
+            }
+        }
+        if !fields.is_empty() {
+            cmd.arg(format!("--http-header-fields={}", fields.join(",")));
+        }
     } else if bin_lc.contains("vlc") {
+        if let Some(start) = opts.start {
+            cmd.arg(format!("--start-time={start}"));
+        }
+        // VLC takes one subtitle file; give it the best match.
+        if let Some(sub) = opts.subtitles.first().and_then(|s| local_subtitle(s)) {
+            cmd.arg(format!("--sub-file={sub}"));
+        }
+        for (name, value) in &opts.headers {
+            if name.eq_ignore_ascii_case("referer") {
+                cmd.arg(format!("--http-referrer={value}"));
+            } else if name.eq_ignore_ascii_case("user-agent") {
+                cmd.arg(format!("--http-user-agent={value}"));
+            }
+        }
         // `--opt=value`, not `--opt value`: given a detached value VLC treats it
         // as a second playlist entry, which leaves the stream queued but never
         // started (you have to double-click it in the playlist to play).
@@ -1159,5 +2203,95 @@ pub fn human_bytes(n: u64) -> String {
         format!("{} {}", n, UNITS[i])
     } else {
         format!("{:.1} {}", v, UNITS[i])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn result(title: &str, hash: &str, seeders: i64) -> SearchResult {
+        SearchResult {
+            title: title.into(),
+            size: 700_000_000,
+            seeders,
+            leechers: 1,
+            magnet: Some(search::build_magnet(hash, title)),
+            link: None,
+            indexer: "Knaben".into(),
+            rating: None,
+        }
+    }
+
+    fn item(name: &str, kind: &str, year: &str) -> MetaItem {
+        MetaItem {
+            id: "tt1".into(),
+            kind: kind.into(),
+            name: name.into(),
+            poster: None,
+            release_info: Some(year.into()),
+            imdb_rating: None,
+            genres: vec![],
+            description: None,
+        }
+    }
+
+    #[test]
+    fn indexer_results_become_episode_streams() {
+        let h = |c: char| c.to_string().repeat(40);
+        let results = vec![
+            result("The.Office.US.S01E03.720p.WEB", &h('a'), 50),
+            result("The Office S01E04 1080p", &h('b'), 90),
+            result("The.Office.S01.Complete.1080p", &h('c'), 200),
+            result("Parks and Recreation S01E03 1080p", &h('d'), 80),
+            SearchResult { magnet: None, link: Some("https://x/t.torrent".into()), ..result("The Office S01E03 480p", &h('e'), 10) },
+            result("The.Office.S01E03.1080p.BluRay.x264", &h('f'), 20),
+            // Real results for this query that belong to other shows.
+            result("The Office Movers S01E03 Pop-Up 1080p AMZN WEB", &h('g'), 30),
+            result("The.Office.2024.S01E03.480p.x264-RUBiK", &h('i'), 30),
+            result("At.The.Office.Microwave.S01E03.720p.HEVC.x265", &h('j'), 30),
+            result("Joe and Davids Magical Sitcom Tour S01E03 The Office", &h('k'), 30),
+        ];
+        let s = streams_from_results(results, "The Office", "2005–2013", 1, 3);
+        let releases: Vec<&str> = s.iter().map(|x| x.release.as_str()).collect();
+        assert_eq!(
+            releases,
+            ["The.Office.S01E03.1080p.BluRay.x264", "The.Office.US.S01E03.720p.WEB"],
+            "other episodes, packs, other shows and magnet-less results are dropped; 1080p ranks first"
+        );
+        assert_eq!(s[0].seeders, Some(20));
+        assert_eq!(s[0].origin.as_deref(), Some("Knaben"));
+        assert!(matches!(&s[0].source, Source::Torrent { info_hash, file_idx: None, .. } if *info_hash == h('f')));
+    }
+
+    #[test]
+    fn movie_results_need_the_title_then_the_year() {
+        let h = |c: char| c.to_string().repeat(40);
+        let results = vec![
+            result("Inception.2010.1080p.BluRay", &h('a'), 30),
+            result("Inception 2011 720p", &h('b'), 30),
+            result("Inception Behind the Scenes 2010", &h('c'), 30),
+            result("Inception 1999 VHS", &h('d'), 30),
+            result("Inception 1080p no year", &h('e'), 30),
+        ];
+        let s = streams_from_results(results, "Inception", "2010", 0, 0);
+        let mut releases: Vec<&str> = s.iter().map(|x| x.release.as_str()).collect();
+        releases.sort();
+        assert_eq!(releases, ["Inception 2011 720p", "Inception.2010.1080p.BluRay"], "year within one, right after the title");
+    }
+
+    #[test]
+    fn show_title_matching() {
+        assert!(title_matches("The Office US S01E03 Health Care", "The Office", "2005–2013", true));
+        assert!(title_matches("The.Office.2005.S01E03.720p", "The Office", "2005–2013", true));
+        assert!(!title_matches("The.Office.S01.Complete", "The Office", "2005–2013", true), "no episode tag");
+        assert!(!title_matches("The Office", "The Office", "2005", true), "nothing after the name");
+        assert!(title_matches("Grey's Anatomy S02E01", "Grey's Anatomy", "2005", true), "punctuation in the name");
+    }
+
+    #[test]
+    fn indexer_queries() {
+        assert_eq!(indexer_query(&item("The Office", "series", "2005–2013"), 1, 3), "The Office S01E03");
+        assert_eq!(indexer_query(&item("Inception", "movie", "2010"), 0, 0), "Inception 2010");
     }
 }

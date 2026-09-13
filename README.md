@@ -95,6 +95,8 @@ torflix -d /mnt/nas/movies "magnet:?xt=urn:btih:..."
 | `Esc` | clear query |
 | `Ctrl+U` | clear query |
 | `Tab` | go to downloads view |
+| `Ctrl+P` | switch what the box searches: torrents ↔ catalog |
+| `/` | slash commands (`/browse`, `/favorites`, `/tv`, …) |
 | `?` | toggle help |
 
 ### Search results
@@ -237,6 +239,48 @@ Set `TORFLIX_OMDB_KEY` to show IMDb and Rotten Tomatoes scores for your search q
 - Track progress in the downloads view (`Tab`)
 
 When streaming from a multi-file torrent (a season pack, say), torflix fetches only the episode you're watching, so the rest of the pack doesn't compete with it for peers and bandwidth.
+
+## Catalog mode, subtitles & resume
+
+Press `Ctrl+P` on the home screen to search the **catalog** instead of torrent indexers. It uses [Stremio addons](https://github.com/Stremio/stremio-addon-sdk): titles, posters and ratings come from Cinemeta, and a series opens with its seasons and episodes.
+
+| Key (details view) | Action |
+|-----|--------|
+| `Enter` | pick a season → episode → play a stream |
+| `Tab` / `←` `→` | move between the seasons, episodes and streams panes |
+| `f` | star / unstar |
+| `d` | download the selected stream |
+| `t` | search the torrent indexers for this title instead |
+
+**Streams** come from stream addons you install yourself: `/addons`, then `a` and paste the addon's manifest URL. Torrent streams play through the built-in engine, fetching only the file you picked; direct HTTP streams go straight to the player with any headers the addon requires. torflix doesn't ship with a stream addon.
+
+**Subtitles** are fetched from OpenSubtitles (installed by default, plus any subtitle addons you add) in your chosen language, while the video is still loading. A subtitle is only in sync with the release it was timed to, so torflix ranks them: same release group first, then the same kind of source (BluRay rips together, WEB-DL and WEBRip together), then the 23.976 fps that BluRay and WEB releases use. Subtitles made for cam/telesync copies go last. mpv gets the best few, with the top one selected:
+
+| Key in mpv | |
+|-----|--|
+| `j` | next subtitle, if the current one is out of sync |
+| `z` / `x` | shift subtitle timing earlier / later |
+
+Sometimes no properly timed subtitle exists — early on, OpenSubtitles often only has cam-copy subtitles for a movie — and shifting with `z`/`x` is the only fix. VLC gets just the best match. Change the language or turn subtitles off in `/settings`.
+
+**Resume**: when you watch in mpv, torflix remembers where you stopped and picks up from there next time — for catalog streams, torrent search results and files in the downloads view alike. VLC resumes from positions recorded in mpv but can't record them itself.
+
+### Commands
+
+Type these in the home search box:
+
+| Command | |
+|---------|--|
+| `/browse` | popular and top-rated movies & series (`b` cycles lists) |
+| `/favorites` | titles you've starred |
+| `/history` | everything you've watched or downloaded |
+| `/downloads` | torrents in progress |
+| `/tv` | live TV from M3U playlists — `a` add a URL or file, `/` filter, `m` manage |
+| `/addons` | install, enable or remove Stremio addons |
+| `/settings` | player, subtitle language, download folder, default search |
+| `/help`, `/quit` | |
+
+Settings live in `~/.config/torflix/` (`config.json`, `addons.json`, `tv.json`); favorites, history and resume positions in `~/.local/share/torflix/`. Environment variables such as `TORFLIX_PLAYER` still take precedence.
 
 ## Background downloads
 
