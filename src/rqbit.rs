@@ -198,10 +198,7 @@ impl Client {
     }
 
     fn add_inner(&self, magnet_url_or_path: &str, output_folder: Option<&Path>) -> Result<u64> {
-        let mut url = format!("{}/torrents?overwrite=true", self.base);
-        if let Some(folder) = output_folder {
-            url.push_str(&format!("&output_folder={}", folder.to_string_lossy()));
-        }
+        let url = add_url(&self.base, output_folder);
         let input = magnet_url_or_path.trim();
         let req = if Path::new(input).is_file() {
             let bytes = std::fs::read(input)?;
@@ -282,6 +279,17 @@ impl Client {
     pub fn playlist_url(&self, id: u64) -> String {
         format!("{}/torrents/{}/playlist", self.base, id)
     }
+}
+
+/// The add-torrent URL. The folder has to be percent-encoded: download folders are
+/// named after the title, and a raw space makes the request line invalid (HTTP 400).
+fn add_url(base: &str, output_folder: Option<&Path>) -> String {
+    let mut url = format!("{base}/torrents?overwrite=true");
+    if let Some(folder) = output_folder {
+        url.push_str("&output_folder=");
+        url.push_str(&crate::search::urlencode(&folder.to_string_lossy()));
+    }
+    url
 }
 
 /// Drop stream/preview torrents left behind by a torflix that exited mid-stream.
@@ -447,6 +455,14 @@ mod tests {
         assert_eq!(bind_addr("http://[::1]:5050"), "[::1]:5050".parse().unwrap());
         // Unparseable (e.g. no port) falls back to the default rather than failing to start.
         assert_eq!(bind_addr("http://example.com"), "127.0.0.1:3030".parse().unwrap());
+    }
+
+    #[test]
+    fn add_url_encodes_the_output_folder() {
+        assert_eq!(add_url("http://x:3030", None), "http://x:3030/torrents?overwrite=true");
+        let url = add_url("http://x:3030", Some(Path::new("/home/u/Downloads/torflix/Inception (2010)")));
+        assert!(!url.contains(' '), "a raw space would make the request invalid: {url}");
+        assert!(url.ends_with("&output_folder=%2Fhome%2Fu%2FDownloads%2Ftorflix%2FInception%20%282010%29"), "{url}");
     }
 
     #[test]

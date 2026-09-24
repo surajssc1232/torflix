@@ -38,17 +38,10 @@ fn purge_stale_temp_dirs() {
     }
 }
 
+/// The engine's default output folder. Same place downloads go, so there's one
+/// folder to look in rather than two.
 fn download_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("TORFLIX_DOWNLOAD_DIR") {
-        return PathBuf::from(dir);
-    }
-    if let Some(dir) = config::load().download_dir.filter(|d| !d.trim().is_empty()) {
-        return PathBuf::from(dir);
-    }
-    dirs::video_dir()
-        .or_else(dirs::download_dir)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("torflix")
+    app::download_dir()
 }
 
 fn main() -> Result<()> {

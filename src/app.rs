@@ -531,17 +531,22 @@ impl App {
         let player_cmd = find_player();
 
         if player_cmd.is_none() {
-            history::record(&label, &target, HistoryKind::Download, None);
+            let dest = download_dir().join(safe_dir_name(&label));
+            history::record(&label, &target, HistoryKind::Download, Some(dest.display().to_string()));
             self.status = format!("⬇ adding: {} — no player found, downloading…", label);
-            thread::spawn(move || match client.add(&target) {
+            thread::spawn(move || {
+                std::fs::create_dir_all(&dest).ok();
+                match client.add_to_dir(&target, &dest) {
                 Ok(_) => {
                     let _ = tx.send(format!(
-                        "⬇ downloading: {}  (install mpv or vlc to stream instead)",
-                        label
+                        "⬇ downloading: {}  →  {}  (install mpv or vlc to stream instead)",
+                        label,
+                        dest.display()
                     ));
                 }
                 Err(e) => {
                     let _ = tx.send(format!("✗ add failed: {}", e));
+                }
                 }
             });
             return;
@@ -753,7 +758,8 @@ impl App {
         let tx = self.status_tx.clone();
         let target = target.to_string();
         let label = label.to_string();
-        let dest = download_dir();
+        // Its own folder, so a multi-file torrent doesn't spill into the download dir.
+        let dest = download_dir().join(safe_dir_name(&label));
         history::record(&label, &target, HistoryKind::Download, Some(dest.display().to_string()));
         self.status = format!("⬇ queuing: {} → {}", label, dest.display());
         thread::spawn(move || {
@@ -2182,6 +2188,40 @@ fn spawn_player(player_cmd: &str, url: &str, title: &str, opts: &PlayOpts) -> st
         .spawn()
 }
 
+/// A folder name for a download, safe on every platform: no path separators or
+/// characters Windows rejects, no trailing dots or spaces, and not a reserved name.
+pub fn safe_dir_name(label: &str) -> String {
+    const RESERVED: &[&str] = &[
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    let cleaned: String = label
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if c.is_control() => ' ',
+            c => c,
+        })
+        .collect();
+    // Collapse whitespace so a wrapped title doesn't become a ragged folder name.
+    let mut name = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    name.truncate(
+        name.char_indices()
+            .nth(100)
+            .map(|(i, _)| i)
+            .unwrap_or(name.len()),
+    );
+    let name = name.trim_matches(['.', ' ']).to_string();
+    if name.is_empty() {
+        return "download".to_string();
+    }
+    let stem = name.split('.').next().unwrap_or(&name);
+    if RESERVED.iter().any(|r| stem.eq_ignore_ascii_case(r)) {
+        return format!("_{name}");
+    }
+    name
+}
+
 fn snip_label(s: &str) -> String {
     let s = s.trim();
     if s.chars().count() <= 48 {
@@ -2287,6 +2327,145 @@ mod tests {
         assert!(!title_matches("The.Office.S01.Complete", "The Office", "2005–2013", true), "no episode tag");
         assert!(!title_matches("The Office", "The Office", "2005", true), "nothing after the name");
         assert!(title_matches("Grey's Anatomy S02E01", "Grey's Anatomy", "2005", true), "punctuation in the name");
+    }
+
+    #[test]
+    fn download_folder_names_are_safe() {
+        assert_eq!(safe_dir_name("Inception (2010)"), "Inception (2010)");
+        assert_eq!(safe_dir_name("The Office S01E03 · Health Care"), "The Office S01E03 · Health Care");
+        assert_eq!(safe_dir_name("AC/DC: Live\\2024?"), "AC_DC_ Live_2024_");
+        assert_eq!(safe_dir_name("  spaced   out \n title "), "spaced out title");
+        assert_eq!(safe_dir_name("trailing dots..."), "trailing dots");
+        assert_eq!(safe_dir_name(""), "download");
+        assert_eq!(safe_dir_name("..."), "download");
+        assert_eq!(safe_dir_name("CON"), "_CON", "reserved on Windows");
+        assert_eq!(safe_dir_name("com1.mkv"), "_com1.mkv");
+        assert_eq!(safe_dir_name("Contact (1997)"), "Contact (1997)", "only exact reserved names");
+        let long = safe_dir_name(&"ザ".repeat(200));
+        assert_eq!(long.chars().count(), 100, "capped without splitting a character");
+    }
+
+    fn bstr(s: &[u8]) -> Vec<u8> {
+        let mut out = format!("{}:", s.len()).into_bytes();
+        out.extend_from_slice(s);
+        out
+    }
+
+    /// A .torrent file for `name`. Piece hashes are zeroed: nothing is verified
+    /// here, we only care where rqbit puts the files.
+    fn write_torrent(path: &std::path::Path, name: &str, files: &[(&str, usize)]) {
+        let total: usize = files.iter().map(|(_, len)| len).sum();
+        let pieces = vec![0u8; 20 * total.div_ceil(262_144)];
+        let mut info = b"d".to_vec();
+        if files.len() > 1 {
+            info.extend(bstr(b"files"));
+            info.push(b'l');
+            for (rel, len) in files {
+                info.push(b'd');
+                info.extend(bstr(b"length"));
+                info.extend(format!("i{len}e").into_bytes());
+                info.extend(bstr(b"path"));
+                info.push(b'l');
+                for part in rel.split('/') {
+                    info.extend(bstr(part.as_bytes()));
+                }
+                info.extend(b"ee");
+            }
+            info.push(b'e');
+        } else {
+            info.extend(bstr(b"length"));
+            info.extend(format!("i{}e", files[0].1).into_bytes());
+        }
+        info.extend(bstr(b"name"));
+        info.extend(bstr(name.as_bytes()));
+        info.extend(bstr(b"piece length"));
+        info.extend(b"i262144e");
+        info.extend(bstr(b"pieces"));
+        info.extend(bstr(&pieces));
+        info.push(b'e');
+
+        let mut torrent = b"d".to_vec();
+        torrent.extend(bstr(b"announce"));
+        torrent.extend(bstr(b"http://127.0.0.1:1/announce"));
+        torrent.extend(bstr(b"info"));
+        torrent.extend(info);
+        torrent.push(b'e');
+        std::fs::write(path, torrent).unwrap();
+    }
+
+    /// Downloads must each get their own folder, instead of every file landing
+    /// loose in the download directory (rqbit skips its own per-torrent folder
+    /// when given an explicit output folder).
+    #[test]
+    #[ignore = "starts a local rqbit engine on port 3946"]
+    fn download_goes_into_its_own_folder() {
+        let root = std::env::temp_dir().join(format!("torflix-dl-test-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let (dl, engine_dir) = (root.join("dl"), root.join("engine"));
+        std::fs::create_dir_all(&dl).unwrap();
+        // Keep the real config, history and downloads out of this.
+        std::env::set_var("TORFLIX_CONFIG_DIR", root.join("cfg"));
+        std::env::set_var("XDG_DATA_HOME", root.join("data"));
+        std::env::set_var("TORFLIX_DOWNLOAD_DIR", &dl);
+
+        write_torrent(&root.join("single.torrent"), "single-movie.bin", &[("single-movie.bin", 300_000)]);
+        write_torrent(&root.join("pack.torrent"), "Season Pack", &[("ep1.bin", 200_000), ("extras/ep2.bin", 200_000)]);
+
+        let api = "http://127.0.0.1:3946";
+        let mut engine = crate::rqbit::start_embedded_engine(&engine_dir, api).expect("engine");
+        let client = Client::new(api);
+        for _ in 0..40 {
+            if client.is_up() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+
+        let mut app = App::new(client);
+        app.download_to_disk_async(&root.join("single.torrent").display().to_string(), "Inception (2010)", None);
+        app.download_to_disk_async(&root.join("pack.torrent").display().to_string(), "The Office S01 · Pack", None);
+
+        let movie = dl.join("Inception (2010)");
+        let pack = dl.join("The Office S01 · Pack");
+        // Wait for both to be registered with the engine.
+        let mut torrents = Vec::new();
+        for _ in 0..80 {
+            torrents = app.client.list().unwrap_or_default();
+            if torrents.len() >= 2 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+        while let Ok(msg) = app.status_rx.try_recv() {
+            println!("  status: {msg}");
+        }
+        // Where the engine will write each torrent — with no peers no files appear yet.
+        let mut folders: Vec<String> = torrents
+            .iter()
+            .filter_map(|t| app.client.details(t.id).ok())
+            .map(|d| d.output_folder)
+            .collect();
+        folders.sort();
+        for f in &folders {
+            println!("  output folder: {f}");
+        }
+        engine.stop();
+
+        assert_eq!(
+            folders,
+            [movie.display().to_string(), pack.display().to_string()],
+            "each torrent writes into its own folder"
+        );
+
+        let mut top: Vec<String> = std::fs::read_dir(&dl)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        top.sort();
+        assert_eq!(top, ["Inception (2010)", "The Office S01 · Pack"], "one folder per download, nothing loose");
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

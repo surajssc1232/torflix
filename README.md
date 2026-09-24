@@ -216,7 +216,7 @@ set -gx TORFLIX_PROWLARR_APIKEY "your_api_key_here"
 | `TORFLIX_JACKETT_APIKEY` | — | Jackett API key |
 | `TORFLIX_OMDB_KEY` | — | [OMDb API key](https://www.omdbapi.com/apikey.aspx) for IMDb + RT ratings |
 | `TORFLIX_PLAYER` | auto | Player override (e.g. `mpv --fullscreen`) |
-| `TORFLIX_DOWNLOAD_DIR` | `~/Downloads/torflix` | Permanent download directory (also settable per-session with `-d <path>`) |
+| `TORFLIX_DOWNLOAD_DIR` | `~/Downloads/torflix` | Permanent download directory (also settable per-session with `-d <path>`, or in `/settings`) |
 | `TORFLIX_RQBIT_URL` | `http://127.0.0.1:3030` | rqbit API URL (if running externally) |
 
 ## Ratings (optional)
@@ -228,6 +228,8 @@ Set `TORFLIX_OMDB_KEY` to show IMDb and Rotten Tomatoes scores for your search q
 3. Set `TORFLIX_OMDB_KEY=your_key_here` in your shell config
 
 ## Streaming vs downloading
+
+Each download gets its own folder named after the title — `~/Downloads/torflix/Inception (2010)/…` — so multi-file torrents don't spill into the download directory.
 
 **With a player (mpv or vlc):**
 - Files land in a temp dir under `/tmp/torflix-*`
