@@ -380,7 +380,7 @@ fn status_style(status: &str) -> (String, Style) {
 fn draw_help(f: &mut Frame, area: Rect, app: &App) {
     let help: &str = match app.view {
         View::Home          => " Enter: search   Ctrl+P: torrents/catalog   /: commands   Ctrl+J: downloads   Ctrl+H: history   q: quit   ?: help",
-        View::Discover      => " Enter: open   f: star   b: next list   j/k: move   Esc: back   q: quit",
+        View::Discover      => " Enter: open   d: download   D: download to…   f: star   b: next list   Esc: back   q: quit",
         View::Details       => " Enter: select/play   Tab: next pane   d: download   D: download to…   f: star   t: torrents   Esc: back",
         View::Tv if app.tv_filter_active
                             => " type: filter channels   Enter: keep   Esc: clear",
@@ -441,6 +441,7 @@ fn draw_help_popup(f: &mut Frame, area: Rect) {
         Line::from(""),
         section("Catalog list & details"),
         row("Enter",       "open title · pick season/episode · play stream"),
+        row("d / D",       "download a movie straight from the list (D picks the folder)"),
         row("Tab",         "next pane (seasons → episodes → streams)"),
         row("f",           "star / unstar"),
         row("d",           "download the selected stream"),

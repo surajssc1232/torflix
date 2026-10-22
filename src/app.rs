@@ -91,11 +91,20 @@ pub enum InputPurpose {
 }
 
 /// A download held back while the user types the folder it should go in.
+/// `target` is `None` when it was started from the catalog list, where the
+/// title's streams are still resolving and there's nothing to add yet.
 #[derive(Clone)]
 pub struct PendingDownload {
-    pub target: String,
+    pub target: Option<String>,
     pub label: String,
     pub file_idx: Option<usize>,
+}
+
+/// A catalog download waiting for the open title's streams to arrive.
+#[derive(Clone)]
+pub struct AwaitingStreams {
+    pub label: String,
+    pub dest: std::path::PathBuf,
 }
 
 pub enum SearchStatus {
@@ -310,6 +319,8 @@ pub struct App {
     pub input_return: View,
     /// Download waiting on the folder being typed into the popup.
     pub pending_download: Option<PendingDownload>,
+    /// Download waiting on the open title's streams to resolve.
+    pub awaiting_streams: Option<AwaitingStreams>,
 
     // Live TV
     pub tv_channels: Arc<Mutex<Load<(Vec<tv::Channel>, Vec<String>)>>>,
@@ -379,6 +390,7 @@ impl App {
             input_purpose: InputPurpose::Torrent,
             input_return: View::Torrents,
             pending_download: None,
+            awaiting_streams: None,
             tv_channels: Arc::new(Mutex::new(Load::Idle)),
             tv_playlists: tv::load_config().playlists,
             tv_filter: String::new(),
@@ -694,7 +706,10 @@ impl App {
                 } else {
                     crate::config::expand_tilde(&input)
                 };
-                self.download_into(&p.target, &p.label, p.file_idx, dest);
+                match p.target {
+                    Some(target) => self.download_into(&target, &p.label, p.file_idx, dest),
+                    None => self.wait_for_streams(p.label, dest),
+                }
             }
         }
     }
@@ -757,10 +772,66 @@ impl App {
         self.input = default.display().to_string();
     }
 
+    /// `d` / `D` on a catalog title: open it, then download the best stream as
+    /// soon as the addons answer. A series has no single thing to download, so
+    /// it says to pick an episode instead.
+    pub fn download_catalog_selected(&mut self, ask_where: bool) {
+        let Some(item) = self.selected_catalog_item() else { return };
+        if item.is_series() {
+            self.status = "open the series and pick an episode to download".into();
+            return;
+        }
+        let year = item.year_label();
+        let label = if year.is_empty() {
+            item.name.clone()
+        } else {
+            format!("{} ({year})", item.name)
+        };
+        self.open_details_for(item); // starts the stream lookup
+        if ask_where {
+            let default = download_dir().join(safe_dir_name(&label));
+            self.pending_download = Some(PendingDownload { target: None, label, file_idx: None });
+            self.open_input(InputPurpose::DownloadTo);
+            self.input = default.display().to_string();
+            return;
+        }
+        let dest = download_dir().join(safe_dir_name(&label));
+        self.wait_for_streams(label, dest);
+    }
+
+    fn wait_for_streams(&mut self, label: String, dest: std::path::PathBuf) {
+        self.status = format!("⧗ {label} — finding a stream…");
+        self.awaiting_streams = Some(AwaitingStreams { label, dest });
+    }
+
+    /// Start a catalog download once its streams are in. Called every tick.
+    fn poll_awaiting_streams(&mut self) {
+        if self.awaiting_streams.is_none() {
+            return;
+        }
+        let Some(d) = self.details.as_ref() else {
+            self.awaiting_streams = None; // the title was closed
+            return;
+        };
+        let best = match &*d.streams.lock().unwrap() {
+            Load::Ready((streams, _)) => Some(streams.iter().find(|s| s.is_torrent()).cloned()),
+            Load::Failed(_) => Some(None),
+            _ => None, // still loading
+        };
+        let Some(best) = best else { return };
+        let w = self.awaiting_streams.take().expect("checked above");
+        match best {
+            Some(stream) => {
+                self.download_into(&stream.target(), &w.label, stream.file_idx(), w.dest)
+            }
+            None => self.status = format!("✗ no torrent stream for {} — try t", w.label),
+        }
+    }
+
     /// What `d`/`D` would act on in the current view.
     fn pick_download(&mut self) -> Option<PendingDownload> {
         let make = |target: String, label: String, file_idx: Option<usize>| {
-            Some(PendingDownload { target, label, file_idx })
+            Some(PendingDownload { target: Some(target), label, file_idx })
         };
         match self.view {
             View::SearchResults => {
@@ -1742,6 +1813,7 @@ impl App {
 
     /// Apply results of background work that change app state, not just the status line.
     pub fn poll_background(&mut self) {
+        self.poll_awaiting_streams();
         let installed = self.installed_addon.lock().unwrap().take();
         if let Some(addon) = installed {
             let (name, caps) = (addon.name.clone(), addon.capabilities());

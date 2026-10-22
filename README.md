@@ -259,7 +259,10 @@ Press `Ctrl+P` on the home screen to search the **catalog** instead of torrent i
 | `Tab` / `←` `→` | move between the seasons, episodes and streams panes |
 | `f` | star / unstar |
 | `d` | download the selected stream |
+| `D` | download it into a folder you type |
 | `t` | search the torrent indexers for this title instead |
+
+On the catalog list itself, `d` downloads a movie's best stream without opening it first, and `D` does the same after asking where to put it. A series has no single thing to download, so open it and pick an episode.
 
 **Streams** come from stream addons you install yourself: `/addons`, then `a` and paste the addon's manifest URL. Torrent streams play through the built-in engine, fetching only the file you picked; direct HTTP streams go straight to the player with any headers the addon requires. torflix doesn't ship with a stream addon.
 

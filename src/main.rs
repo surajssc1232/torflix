@@ -353,6 +353,8 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                             }
                         }
                         KeyCode::Enter | KeyCode::Char('l') => app.open_details(),
+                        KeyCode::Char('d') => app.download_catalog_selected(false),
+                        KeyCode::Char('D') => app.download_catalog_selected(true),
                         KeyCode::Char('f') => app.toggle_favorite(),
                         KeyCode::Char('b') => app.next_browse(),
                         _ => {}
