@@ -1,4 +1,4 @@
-use crate::app::{human_bytes, is_video, App, Details, FileSortMode, InputPurpose, Load, Pane, PreviewState, SearchPreview, SearchStatus, SortMode, View};
+use crate::app::{human_bytes, is_video, progress_size, App, Details, FileSortMode, InputPurpose, Load, Pane, PreviewState, SearchPreview, SearchStatus, SortMode, View};
 use crate::history;
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -268,12 +268,19 @@ fn draw_torrents(f: &mut Frame, area: Rect, app: &App) {
     let rows: Vec<Row> = rows_data
         .iter()
         .map(|t| {
-            let (pct, speed, peers, eta, state) = match &t.stats {
+            let (pct, size, speed, peers, eta, state) = match &t.stats {
                 Some(s) => {
                     let state_str = if s.finished { "done".to_string() } else { s.state.clone() };
-                    (s.progress_pct(), s.down_speed(), s.peers().to_string(), s.eta().unwrap_or_else(|| "-".into()), state_str)
+                    (
+                        s.progress_pct(),
+                        progress_size(s.progress_bytes, s.total_bytes),
+                        s.down_speed(),
+                        s.peers().to_string(),
+                        s.eta().unwrap_or_else(|| "-".into()),
+                        state_str,
+                    )
                 }
-                None => (0.0, "-".into(), "-".into(), "-".into(), "…".into()),
+                None => (0.0, "-".into(), "-".into(), "-".into(), "-".into(), "…".into()),
             };
             let state_style = match state.as_str() {
                 "live"   => Style::default().fg(GREEN),
@@ -285,6 +292,7 @@ fn draw_torrents(f: &mut Frame, area: Rect, app: &App) {
             Row::new(vec![
                 ratatui::widgets::Cell::from(t.name.clone()),
                 ratatui::widgets::Cell::from(progress_bar_spans(pct, 14)),
+                ratatui::widgets::Cell::from(size),
                 ratatui::widgets::Cell::from(speed),
                 ratatui::widgets::Cell::from(peers),
                 ratatui::widgets::Cell::from(eta),
@@ -298,6 +306,7 @@ fn draw_torrents(f: &mut Frame, area: Rect, app: &App) {
         [
             Constraint::Min(24),
             Constraint::Length(22), // 14 bar + space + 6 for " xx.x%"
+            Constraint::Length(18), // "900.0 MiB/2.0 GiB"
             Constraint::Length(12),
             Constraint::Length(6),
             Constraint::Length(12),
@@ -305,7 +314,7 @@ fn draw_torrents(f: &mut Frame, area: Rect, app: &App) {
         ],
     )
     .header(
-        Row::new(vec!["name", "progress", "speed", "peers", "eta", "state"])
+        Row::new(vec!["name", "progress", "size", "speed", "peers", "eta", "state"])
             .style(Style::default().fg(YELLOW).add_modifier(Modifier::BOLD)),
     )
     .block(

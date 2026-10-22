@@ -2486,6 +2486,22 @@ fn snip_label(s: &str) -> String {
     }
 }
 
+/// "1.2/2.0 GiB" while a download runs, "2.0 GiB" once it's all there. Both
+/// halves share a unit where they can, so the column stays narrow.
+pub fn progress_size(done: u64, total: u64) -> String {
+    if total == 0 {
+        return "-".into();
+    }
+    if done >= total {
+        return human_bytes(total);
+    }
+    let (d, t) = (human_bytes(done), human_bytes(total));
+    match (d.rsplit_once(' '), t.rsplit_once(' ')) {
+        (Some((dn, du)), Some((_, tu))) if du == tu => format!("{dn}/{t}"),
+        _ => format!("{d}/{t}"),
+    }
+}
+
 pub fn human_bytes(n: u64) -> String {
     const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
     let mut v = n as f64;
@@ -2646,6 +2662,15 @@ mod tests {
         torrent.extend(info);
         torrent.push(b'e');
         std::fs::write(path, torrent).unwrap();
+    }
+
+    #[test]
+    fn download_size_shares_a_unit_where_it_can() {
+        assert_eq!(progress_size(0, 0), "-");
+        assert_eq!(progress_size(2_000, 2_000), "2.0 KiB");
+        assert_eq!(progress_size(3_000, 2_000), "2.0 KiB"); // never over 100%
+        assert_eq!(progress_size(1_288_490_189, 2_147_483_648), "1.2/2.0 GiB");
+        assert_eq!(progress_size(943_718_400, 2_147_483_648), "900.0 MiB/2.0 GiB");
     }
 
     #[test]
