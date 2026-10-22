@@ -6,6 +6,7 @@ pub enum Command {
     Favorites,
     History,
     Downloads,
+    Tidy,
     Tv,
     Addons,
     Settings,
@@ -14,11 +15,12 @@ pub enum Command {
 }
 
 impl Command {
-    pub const ALL: [Command; 9] = [
+    pub const ALL: [Command; 10] = [
         Command::Browse,
         Command::Favorites,
         Command::History,
         Command::Downloads,
+        Command::Tidy,
         Command::Tv,
         Command::Addons,
         Command::Settings,
@@ -32,6 +34,7 @@ impl Command {
             Command::Favorites => "/favorites",
             Command::History => "/history",
             Command::Downloads => "/downloads",
+            Command::Tidy => "/tidy",
             Command::Tv => "/tv",
             Command::Addons => "/addons",
             Command::Settings => "/settings",
@@ -46,6 +49,7 @@ impl Command {
             Command::Favorites => "titles you've starred",
             Command::History => "everything you've watched or downloaded",
             Command::Downloads => "torrents in progress",
+            Command::Tidy => "give finished downloads sitting loose their own folder",
             Command::Tv => "live TV from M3U playlists",
             Command::Addons => "manage Stremio addons (streams, subtitles)",
             Command::Settings => "player, subtitles, download folder",
@@ -61,6 +65,7 @@ impl Command {
             "/favorites" | "/favourites" | "/fav" => Command::Favorites,
             "/history" => Command::History,
             "/downloads" | "/dl" => Command::Downloads,
+            "/tidy" | "/organize" | "/organise" => Command::Tidy,
             "/tv" | "/live" => Command::Tv,
             "/addons" | "/addon" => Command::Addons,
             "/settings" | "/config" | "/prefs" => Command::Settings,
@@ -109,6 +114,7 @@ mod tests {
     fn suggestions() {
         assert_eq!(Command::suggest("/").len(), Command::ALL.len());
         assert_eq!(Command::suggest("/h"), vec![Command::History, Command::Help]);
+        assert_eq!(Command::suggest("/tid"), vec![Command::Tidy]);
         assert_eq!(Command::suggest("/TV"), vec![Command::Tv]);
         assert!(Command::suggest("/history extra").is_empty());
         assert!(Command::suggest("dune").is_empty());

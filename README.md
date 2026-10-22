@@ -68,7 +68,9 @@ $env:TORFLIX_PLAYER = "C:\Program Files\VideoLAN\VLC\vlc.exe"
 torflix
 ```
 
-Type your search query and press **Enter**. Results stream in as each indexer responds. Press **Enter** on a result to stream it, **d** to download permanently, or **f** to preview the file list first.
+Type your search query and press **Enter**. Results stream in as each indexer responds. Press **Enter** on a result to stream it, **d** to download permanently, **D** to download into a folder you pick, or **f** to preview the file list first.
+
+Every download gets its own folder under the download directory, named after the title, so a season pack or a game with a dozen parts stays together instead of spilling loose.
 
 Pass a magnet link, `.torrent` path, or torrent URL directly:
 
@@ -96,6 +98,8 @@ torflix -d /mnt/nas/movies "magnet:?xt=urn:btih:..."
 | `Ctrl+U` | clear query |
 | `Tab` | go to downloads view |
 | `Ctrl+P` | switch what the box searches: torrents ↔ catalog |
+| `Ctrl+J` | downloads (from any screen) |
+| `Ctrl+H` | history (from any screen) |
 | `/` | slash commands (`/browse`, `/favorites`, `/tv`, …) |
 | `?` | toggle help |
 
@@ -105,7 +109,8 @@ torflix -d /mnt/nas/movies "magnet:?xt=urn:btih:..."
 |-----|--------|
 | `j` / `k` / `↑` / `↓` | navigate |
 | `Enter` / `l` | stream selected result (temp dir, auto-deleted after playback) |
-| `d` | download permanently to `~/Downloads/torflix` |
+| `d` | download permanently to `~/Downloads/torflix/<title>/` |
+| `D` | download into a folder you type |
 | `f` | preview file list before committing |
 | `/` | open filter bar — type to narrow results by title substring |
 | `o` | cycle sort: seeders → name → size |
@@ -130,6 +135,7 @@ Fetches the torrent's file list from peers before you commit to streaming.
 | `j` / `k` | navigate files |
 | `Enter` / `l` | stream selected file |
 | `d` | download whole torrent to disk |
+| `D` | download it into a folder you type |
 | `o` | sort files: name → size |
 | `f` / `Esc` | close preview |
 
@@ -166,6 +172,7 @@ Everything you stream or download is remembered, newest first.
 | `j` / `k` | navigate |
 | `Enter` / `l` | stream it again |
 | `d` | download permanently |
+| `D` | download into a folder you type |
 | `x` | remove from history |
 | `Tab` / `Esc` | back to home |
 
@@ -277,6 +284,7 @@ Type these in the home search box:
 | `/favorites` | titles you've starred |
 | `/history` | everything you've watched or downloaded |
 | `/downloads` | torrents in progress |
+| `/tidy` | move finished downloads that landed loose into a folder each |
 | `/tv` | live TV from M3U playlists — `a` add a URL or file, `/` filter, `m` manage |
 | `/addons` | install, enable or remove Stremio addons |
 | `/settings` | player, subtitle language, download folder, default search |

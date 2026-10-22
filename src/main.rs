@@ -198,6 +198,28 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                     app.show_help = false;
                     continue;
                 }
+                // History and downloads are reachable from anywhere.
+                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    match key.code {
+                        // Terminals send Ctrl+H as backspace and Ctrl+J as a newline;
+                        // match those too for the ones that pass the modifier along.
+                        KeyCode::Char('h') | KeyCode::Backspace => {
+                            if app.view == View::AddInput {
+                                app.cancel_input();
+                            }
+                            app.open_history();
+                            continue;
+                        }
+                        KeyCode::Char('j') | KeyCode::Enter => {
+                            if app.view == View::AddInput {
+                                app.cancel_input();
+                            }
+                            app.view = View::Torrents;
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
                 let n_rows = app.rows_snapshot().len();
                 match app.view {
                     View::Home => {
@@ -242,6 +264,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                                 KeyCode::Down | KeyCode::Char('j') => app.preview_down(),
                                 KeyCode::Enter | KeyCode::Char('l') => app.play_from_preview(),
                                 KeyCode::Char('d') => app.download_from_preview(),
+                                KeyCode::Char('D') => app.prompt_download_dest(),
                                 KeyCode::Char('o') => app.preview_cycle_sort(),
                                 KeyCode::Char('f') | KeyCode::Esc | KeyCode::Char('h') => app.close_search_preview(),
                                 KeyCode::Char('q') => app.request_quit(),
@@ -300,6 +323,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                                 }
                                 KeyCode::Enter | KeyCode::Char('l') => app.add_search_selected(),
                                 KeyCode::Char('d') => app.download_search_selected(),
+                                KeyCode::Char('D') => app.prompt_download_dest(),
                                 KeyCode::Char('f') => {
                                     app.search_filter_active = false;
                                     app.open_search_preview();
@@ -342,6 +366,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                         KeyCode::BackTab | KeyCode::Left => app.details_pane(false),
                         KeyCode::Enter | KeyCode::Char('l') => app.details_enter(),
                         KeyCode::Char('d') => app.download_selected_stream(),
+                        KeyCode::Char('D') => app.prompt_download_dest(),
                         KeyCode::Char('f') => app.toggle_favorite(),
                         KeyCode::Char('t') => app.search_torrents_for_details(),
                         _ => {}
@@ -451,6 +476,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                         }
                         KeyCode::Enter | KeyCode::Char('l') => app.history_play(),
                         KeyCode::Char('d') => app.history_download(),
+                        KeyCode::Char('D') => app.prompt_download_dest(),
                         KeyCode::Char('x') => app.history_remove(),
                         _ => {}
                     },

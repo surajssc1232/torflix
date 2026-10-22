@@ -93,13 +93,6 @@ fn title_comma(line: &str) -> Option<usize> {
     line.find(',')
 }
 
-fn expand_tilde(s: &str) -> PathBuf {
-    match s.strip_prefix("~/") {
-        Some(rest) => dirs::home_dir().map(|h| h.join(rest)).unwrap_or_else(|| PathBuf::from(s)),
-        None => PathBuf::from(s),
-    }
-}
-
 fn is_remote(source: &str) -> bool {
     source.starts_with("http://") || source.starts_with("https://")
 }
@@ -109,7 +102,7 @@ pub fn fetch(source: &str) -> Result<Vec<Channel>> {
     let content = if is_remote(source) {
         fetch_remote(source)?
     } else {
-        let path = expand_tilde(source);
+        let path = crate::config::expand_tilde(source);
         std::fs::read_to_string(&path).with_context(|| format!("can't read {}", path.display()))?
     };
     let channels = parse_m3u(&content);
@@ -240,8 +233,8 @@ http://example.com/discovery.m3u8
     #[test]
     fn tilde_expands_to_home() {
         if let Some(home) = dirs::home_dir() {
-            assert_eq!(expand_tilde("~/tv/list.m3u"), home.join("tv/list.m3u"));
+            assert_eq!(crate::config::expand_tilde("~/tv/list.m3u"), home.join("tv/list.m3u"));
         }
-        assert_eq!(expand_tilde("/abs/list.m3u"), PathBuf::from("/abs/list.m3u"));
+        assert_eq!(crate::config::expand_tilde("/abs/list.m3u"), PathBuf::from("/abs/list.m3u"));
     }
 }

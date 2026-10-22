@@ -379,9 +379,9 @@ fn status_style(status: &str) -> (String, Style) {
 
 fn draw_help(f: &mut Frame, area: Rect, app: &App) {
     let help: &str = match app.view {
-        View::Home          => " Enter: search   Ctrl+P: torrents/catalog   /: commands   Tab: downloads   q: quit   ?: help",
+        View::Home          => " Enter: search   Ctrl+P: torrents/catalog   /: commands   Ctrl+J: downloads   Ctrl+H: history   q: quit   ?: help",
         View::Discover      => " Enter: open   f: star   b: next list   j/k: move   Esc: back   q: quit",
-        View::Details       => " Enter: select/play   Tab: next pane   d: download   f: star   t: search torrents   Esc: back",
+        View::Details       => " Enter: select/play   Tab: next pane   d: download   D: download to…   f: star   t: torrents   Esc: back",
         View::Tv if app.tv_filter_active
                             => " type: filter channels   Enter: keep   Esc: clear",
         View::Tv if app.tv_manage
@@ -391,13 +391,13 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
         View::Settings      => " Enter/→: change   ←: previous   j/k: move   Esc: home",
         View::Files         => " Enter: play   p: playlist   j/k: move   Esc: back   q: quit",
         View::SearchResults if app.search_preview.is_some()
-                            => " Enter: stream   d: download   j/k: move   o: sort   f/Esc: close preview",
+                            => " Enter: stream   d: download   D: download to…   j/k: move   o: sort   f/Esc: close preview",
         View::SearchResults if app.search_filter_active
                             => " type: filter   Backspace: delete   Ctrl+U: clear   Esc: clear+close   Enter: keep+close",
-        View::SearchResults => " /: filter   f: files   Enter: stream   d: download   o: sort   s: new search   Esc: back",
+        View::SearchResults => " /: filter   f: files   Enter: stream   d: download   D: download to…   o: sort   s: new search   Esc: back",
         View::ConfirmDelete => " y: confirm   n/Esc: cancel",
         View::Torrents      => " s/Esc: search   Tab: history   a: add   Enter: files   Space: pause   d: remove   q: quit",
-        View::History       => " Enter: stream again   d: download   x: remove   j/k: move   Tab/Esc: home   q: quit",
+        View::History       => " Enter: stream again   d: download   D: download to…   x: remove   j/k: move   Tab/Esc: home   q: quit",
         View::ConfirmQuit   => " y: keep downloading in background   n: quit and pause   Esc: cancel",
         View::AddInput      => " Enter: add   Esc: cancel",
     };
@@ -426,19 +426,25 @@ fn draw_help_popup(f: &mut Frame, area: Rect) {
 
     let lines: Vec<Line> = vec![
         Line::from(""),
+        section("Anywhere"),
+        row("Ctrl+H",      "history"),
+        row("Ctrl+J",      "downloads"),
+        row("?",           "this help"),
+        Line::from(""),
         section("Home / Search"),
         row("type",        "type to build search query"),
         row("Enter",       "search for the typed query"),
         row("Esc",         "clear search query"),
         row("Tab",         "go to downloads view"),
         row("Ctrl+P",      "switch search: torrents ↔ catalog (Stremio)"),
-        row("/",           "commands: /browse /favorites /history …"),
+        row("/",           "commands: /browse /favorites /history /tidy …"),
         Line::from(""),
         section("Catalog list & details"),
         row("Enter",       "open title · pick season/episode · play stream"),
         row("Tab",         "next pane (seasons → episodes → streams)"),
         row("f",           "star / unstar"),
         row("d",           "download the selected stream"),
+        row("D",           "download it into a folder you choose"),
         row("t",           "search torrent indexers for this title"),
         row("b",           "next /browse list"),
         Line::from(""),
@@ -452,6 +458,7 @@ fn draw_help_popup(f: &mut Frame, area: Rect) {
         row("f",           "preview file list"),
         row("Enter",       "stream selected result"),
         row("d",           "download permanently"),
+        row("D",           "download into a folder you choose"),
         row("o",           "cycle sort: seeders → name → size"),
         row("s",           "new search (go back to home)"),
         row("Esc",         "back to home"),
@@ -471,6 +478,7 @@ fn draw_help_popup(f: &mut Frame, area: Rect) {
         section("History view"),
         row("Enter",       "stream it again"),
         row("d",           "download permanently"),
+        row("D",           "download into a folder you choose"),
         row("x",           "remove from history"),
         Line::from(""),
         Line::from(Span::styled("  press ? to open this again  ·  any key to close", Style::default().fg(GRAY))),
@@ -990,6 +998,7 @@ fn draw_add_popup(f: &mut Frame, area: Rect, app: &App) {
                 InputPurpose::Playlist => " add M3U playlist — URL or file path ",
                 InputPurpose::Addon => " install Stremio addon — manifest URL ",
                 InputPurpose::DownloadDir => " download folder — leave empty for the default ",
+                InputPurpose::DownloadTo => " download into — edit the folder, or leave it as is ",
             })
             .border_style(Style::default().fg(YELLOW))
             .style(Style::default().bg(BG)),

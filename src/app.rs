@@ -17,10 +17,12 @@ use std::time::Duration;
 
 pub fn download_dir() -> std::path::PathBuf {
     if let Ok(dir) = std::env::var("TORFLIX_DOWNLOAD_DIR") {
-        return std::path::PathBuf::from(dir);
+        if !dir.trim().is_empty() {
+            return crate::config::expand_tilde(&dir);
+        }
     }
     if let Some(dir) = crate::config::load().download_dir.filter(|d| !d.trim().is_empty()) {
-        return std::path::PathBuf::from(dir);
+        return crate::config::expand_tilde(&dir);
     }
     dirs::download_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
@@ -84,6 +86,16 @@ pub enum InputPurpose {
     Playlist,
     Addon,
     DownloadDir,
+    /// Where this one download should land, asked just before it starts.
+    DownloadTo,
+}
+
+/// A download held back while the user types the folder it should go in.
+#[derive(Clone)]
+pub struct PendingDownload {
+    pub target: String,
+    pub label: String,
+    pub file_idx: Option<usize>,
 }
 
 pub enum SearchStatus {
@@ -296,6 +308,8 @@ pub struct App {
     pub input_purpose: InputPurpose,
     /// View to return to when the popup closes.
     pub input_return: View,
+    /// Download waiting on the folder being typed into the popup.
+    pub pending_download: Option<PendingDownload>,
 
     // Live TV
     pub tv_channels: Arc<Mutex<Load<(Vec<tv::Channel>, Vec<String>)>>>,
@@ -364,6 +378,7 @@ impl App {
             details: None,
             input_purpose: InputPurpose::Torrent,
             input_return: View::Torrents,
+            pending_download: None,
             tv_channels: Arc::new(Mutex::new(Load::Idle)),
             tv_playlists: tv::load_config().playlists,
             tv_filter: String::new(),
@@ -670,6 +685,104 @@ impl App {
                 crate::config::save(&self.config);
                 self.status = format!("downloads go to {}", download_dir().display());
             }
+            InputPurpose::DownloadTo => {
+                let Some(p) = self.pending_download.take() else { return };
+                // Empty means "the usual place"; anything else is taken literally,
+                // so the typed folder is the one the files end up in.
+                let dest = if input.is_empty() {
+                    download_dir().join(safe_dir_name(&p.label))
+                } else {
+                    crate::config::expand_tilde(&input)
+                };
+                self.download_into(&p.target, &p.label, p.file_idx, dest);
+            }
+        }
+    }
+
+    /// `/tidy`: downloads added before torflix gave each torrent its own folder
+    /// unpack straight into the download folder and mix together there. This
+    /// gathers the finished ones into a folder each. Anything still downloading
+    /// is left alone — moving it out from under the engine would break it — so
+    /// run it again once those are done.
+    pub fn tidy_downloads(&mut self) {
+        let root = download_dir();
+        let Ok(list) = self.client.list() else {
+            self.status = "✗ tidy: can't reach the torrent engine".into();
+            return;
+        };
+        let (mut moved, mut unfinished) = (0usize, 0usize);
+        let mut failed: Option<String> = None;
+        for t in list {
+            let Ok(d) = self.client.details(t.id) else { continue };
+            if std::path::Path::new(&d.output_folder) != root {
+                continue; // already in a folder of its own
+            }
+            let name = d
+                .name
+                .clone()
+                .or(t.name)
+                .unwrap_or_else(|| format!("torrent {}", t.id));
+            if !self.client.stats(t.id).map(|s| s.finished).unwrap_or(false) {
+                unfinished += 1;
+                continue;
+            }
+            match move_into_folder(&root, &root.join(safe_dir_name(&name)), &d.files) {
+                Ok(0) => {}
+                Ok(_) => {
+                    // Forgetting keeps the files; left registered, the engine would
+                    // keep seeding from — and re-creating — the old loose paths.
+                    self.client.forget(t.id).ok();
+                    moved += 1;
+                }
+                Err(e) => failed = Some(format!("{name}: {e}")),
+            }
+        }
+        self.status = match (moved, unfinished, failed) {
+            (_, _, Some(e)) => format!("✗ tidy: {e}"),
+            (0, 0, None) => format!("✓ {} is already tidy", root.display()),
+            (0, n, None) => format!("nothing to tidy yet — {n} still downloading into the folder"),
+            (m, 0, None) => format!("✓ tidied {m} download{}", if m == 1 { "" } else { "s" }),
+            (m, n, None) => format!(
+                "✓ tidied {m} — {n} still downloading, run /tidy again when they finish"
+            ),
+        };
+    }
+
+    /// `D` wherever `d` downloads: ask for the folder first.
+    pub fn prompt_download_dest(&mut self) {
+        let Some(pending) = self.pick_download() else { return };
+        let default = download_dir().join(safe_dir_name(&pending.label));
+        self.pending_download = Some(pending);
+        self.open_input(InputPurpose::DownloadTo);
+        self.input = default.display().to_string();
+    }
+
+    /// What `d`/`D` would act on in the current view.
+    fn pick_download(&mut self) -> Option<PendingDownload> {
+        let make = |target: String, label: String, file_idx: Option<usize>| {
+            Some(PendingDownload { target, label, file_idx })
+        };
+        match self.view {
+            View::SearchResults => {
+                let r = self.selected_search_result()?;
+                // The preview holds a temp torrent of its own; drop it first.
+                self.close_search_preview();
+                let target = r.add_target()?.to_string();
+                make(target, r.title, None)
+            }
+            View::Details => {
+                let (stream, label, _) = self.selected_stream()?;
+                if !stream.is_torrent() {
+                    self.status = "✗ only torrent streams can be downloaded".into();
+                    return None;
+                }
+                make(stream.target(), label, stream.file_idx())
+            }
+            View::History => {
+                let e = self.selected_history()?;
+                make(e.target, e.title, None)
+            }
+            _ => None,
         }
     }
 
@@ -720,6 +833,23 @@ impl App {
         refs
     }
 
+    /// The result the search view is acting on — the preview's, when one is open.
+    fn selected_search_result(&self) -> Option<SearchResult> {
+        let idx = self
+            .search_preview
+            .as_ref()
+            .map(|p| p.result_idx)
+            .unwrap_or(self.search_selected);
+        match &*self.search.lock().unwrap() {
+            SearchStatus::Done(v) => self.filtered_results(v).get(idx).map(|r| (*r).clone()),
+            SearchStatus::Searching(partial) => {
+                let v = partial.lock().unwrap();
+                self.filtered_results(&v).get(idx).map(|r| (*r).clone())
+            }
+            _ => None,
+        }
+    }
+
     pub fn filtered_results<'a>(&self, v: &'a [SearchResult]) -> Vec<&'a SearchResult> {
         let sorted = self.sort_results(v);
         if self.search_filter.is_empty() {
@@ -753,13 +883,24 @@ impl App {
     }
 
     /// Download permanently; `file_idx` limits it to one file of a multi-file torrent.
+    /// Its own folder, so a multi-file torrent doesn't spill into the download dir.
     fn download_to_disk_async(&mut self, target: &str, label: &str, file_idx: Option<usize>) {
+        let dest = download_dir().join(safe_dir_name(label));
+        self.download_into(target, label, file_idx, dest);
+    }
+
+    /// Download permanently into `dest`, which is created if it doesn't exist.
+    fn download_into(
+        &mut self,
+        target: &str,
+        label: &str,
+        file_idx: Option<usize>,
+        dest: std::path::PathBuf,
+    ) {
         let client = self.client.clone();
         let tx = self.status_tx.clone();
         let target = target.to_string();
         let label = label.to_string();
-        // Its own folder, so a multi-file torrent doesn't spill into the download dir.
-        let dest = download_dir().join(safe_dir_name(&label));
         history::record(&label, &target, HistoryKind::Download, Some(dest.display().to_string()));
         self.status = format!("⬇ queuing: {} → {}", label, dest.display());
         thread::spawn(move || {
@@ -1082,6 +1223,7 @@ impl App {
             Some(SlashCommand::Favorites) => self.open_favorites(),
             Some(SlashCommand::History) => self.open_history(),
             Some(SlashCommand::Downloads) => self.view = View::Torrents,
+            Some(SlashCommand::Tidy) => self.tidy_downloads(),
             Some(SlashCommand::Help) => self.show_help = true,
             Some(SlashCommand::Quit) => self.request_quit(),
             Some(SlashCommand::Tv) => self.open_tv(),
@@ -1492,6 +1634,7 @@ impl App {
 
     pub fn cancel_input(&mut self) {
         self.input.clear();
+        self.pending_download = None;
         self.view = self.input_return.clone();
     }
 
@@ -2190,6 +2333,46 @@ fn spawn_player(player_cmd: &str, url: &str, title: &str, opts: &PlayOpts) -> st
 
 /// A folder name for a download, safe on every platform: no path separators or
 /// characters Windows rejects, no trailing dots or spaces, and not a reserved name.
+/// Move a torrent's files from `root` into `dest`, keeping the layout the
+/// torrent gave them, and clear up the directories they leave empty behind.
+/// Returns how many files were moved.
+fn move_into_folder(
+    root: &std::path::Path,
+    dest: &std::path::Path,
+    files: &[FileDetails],
+) -> std::io::Result<usize> {
+    let mut moved = 0;
+    for f in files {
+        let rel = std::path::Path::new(&f.name);
+        // A torrent names its own files, so refuse anything that would escape `root`.
+        if rel.components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
+            continue;
+        }
+        let src = root.join(rel);
+        if !src.is_file() {
+            continue;
+        }
+        let target = dest.join(rel);
+        if target.exists() {
+            continue;
+        }
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::rename(&src, &target)?;
+        moved += 1;
+        // The torrent's own subfolders (Season 1, Eng, …) are no use once empty.
+        let mut dir = src.parent().map(|p| p.to_path_buf());
+        while let Some(d) = dir {
+            if d == root || std::fs::remove_dir(&d).is_err() {
+                break;
+            }
+            dir = d.parent().map(|p| p.to_path_buf());
+        }
+    }
+    Ok(moved)
+}
+
 pub fn safe_dir_name(label: &str) -> String {
     const RESERVED: &[&str] = &[
         "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
@@ -2391,6 +2574,32 @@ mod tests {
         torrent.extend(info);
         torrent.push(b'e');
         std::fs::write(path, torrent).unwrap();
+    }
+
+    #[test]
+    fn tidy_gathers_loose_files_and_leaves_nothing_empty_behind() {
+        let root = std::env::temp_dir().join(format!("torflix-tidy-test-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(root.join("Season 1")).unwrap();
+        std::fs::write(root.join("ep1.bin"), b"a").unwrap();
+        std::fs::write(root.join("Season 1/ep2.bin"), b"b").unwrap();
+        std::fs::write(root.join("someone-elses.bin"), b"c").unwrap();
+        std::fs::write(root.join("escape.bin"), b"d").unwrap();
+
+        let file = |name: &str| FileDetails { name: name.into(), length: 1, included: true };
+        let files = vec![file("ep1.bin"), file("Season 1/ep2.bin"), file("../escape.bin")];
+        let dest = root.join("The Show S01");
+        assert_eq!(move_into_folder(&root, &dest, &files).unwrap(), 2);
+
+        assert!(dest.join("ep1.bin").is_file());
+        assert!(dest.join("Season 1/ep2.bin").is_file());
+        // The torrent's own subfolder is gone once its files have moved out.
+        assert!(!root.join("Season 1").exists());
+        // Nothing the torrent doesn't own is touched, and a name that climbs out
+        // of the download folder is refused.
+        assert!(root.join("someone-elses.bin").is_file());
+        assert!(root.join("escape.bin").is_file());
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// Downloads must each get their own folder, instead of every file landing

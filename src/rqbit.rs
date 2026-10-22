@@ -198,6 +198,8 @@ impl Client {
     }
 
     fn add_inner(&self, magnet_url_or_path: &str, output_folder: Option<&Path>) -> Result<u64> {
+        // One add at a time: see ADD_LOCK.
+        let _adding = ADD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let url = add_url(&self.base, output_folder);
         let input = magnet_url_or_path.trim();
         let req = if Path::new(input).is_file() {
@@ -280,6 +282,12 @@ impl Client {
         format!("{}/torrents/{}/playlist", self.base, id)
     }
 }
+
+/// rqbit picks a torrent id by taking the highest one it has and adding one,
+/// then inserts the torrent under it. Two adds in flight at once are handed the
+/// same id, and the second comes back as "already managed" — reported as a
+/// success, but never actually added. Queue them instead.
+static ADD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// The add-torrent URL. The folder has to be percent-encoded: download folders are
 /// named after the title, and a raw space makes the request line invalid (HTTP 400).

@@ -86,6 +86,18 @@ pub fn subtitle_lang_label(code: &str) -> &'static str {
         .unwrap_or("custom")
 }
 
+/// Expand a leading `~` so a hand-typed path like `~/Movies` works.
+pub fn expand_tilde(s: &str) -> PathBuf {
+    let s = s.trim();
+    if s == "~" {
+        return dirs::home_dir().unwrap_or_else(|| PathBuf::from(s));
+    }
+    match s.strip_prefix("~/") {
+        Some(rest) => dirs::home_dir().map(|h| h.join(rest)).unwrap_or_else(|| PathBuf::from(s)),
+        None => PathBuf::from(s),
+    }
+}
+
 pub fn config_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("TORFLIX_CONFIG_DIR") {
         if !dir.is_empty() {
