@@ -9,10 +9,7 @@ homepage = "https://github.com/surajssc1232/torflix"
 readme = "README.md"
 keywords = ["torrent", "streaming", "tui", "mpv", "rqbit"]
 categories = ["command-line-utilities", "multimedia"]
-# nix/ packages torflix for nixpkgs and is no use to a crates.io
-# consumer; leaving it out also keeps its uncommitted state from making
-# `cargo publish` think the package is dirty.
-exclude = [".claude/", "nix/", "*.local.json"]
+exclude = [".claude/", "*.local.json"]
 
 [dependencies]
 ratatui = "0.26"
