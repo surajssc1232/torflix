@@ -20,7 +20,7 @@ cargo install torflix
   ▞▚ covers ▚▞  ▞▚ drawn in ▚  ▞▚ half-   ▚  ▞▚ blocks  ▚
   ▞▚▞▚▞▚▞▚▞▚▞▚  ▞▚▞▚▞▚▞▚▞▚▞▚  ▞▚▞▚▞▚▞▚▞▚▞▚  ▞▚▞▚▞▚▞▚▞▚▞▚
   Hope            Spider-Man: Br…  Buddy           Obsession
-  2026 ★6.9 ◆3.2  2026 ★8.0 ◆4.0   2026 ★7.1 ◆3.1  2026 ★7.8 ◆4.1
+  2026 ◆3.2       2026 ◆4.0        2026 ◆3.1       2026 ◆4.1
  Enter: search   ↓: covers   Ctrl+P: torrents/catalog   /: commands   ?: help
 ```
 
@@ -252,7 +252,7 @@ Press `Ctrl+P` on the home screen to search the **catalog** instead of torrent i
 
 Covers are drawn with half-block characters — one character cell carries two pixels, its foreground colour painting the top and its background the bottom — so they need no terminal graphics protocol and work anywhere 24-bit colour does. They're cached under `~/.cache/torflix/posters`.
 
-Each cover carries both ratings — ★ IMDb out of ten in yellow, ◆ **Letterboxd** out of five in green — and so does a title's details. Letterboxd has no public API, so torflix does what [digital-drop-movies](https://digital-drop-movies.netlify.app/) does: `letterboxd.com/imdb/<id>/` redirects to the film's page, which embeds its `ratingValue` and `ratingCount` as JSON-LD. The page is ~310 KB, but gzipped it's about 43 KB — the size of a poster — so it is asked for compressed, fetched only for covers actually on screen (at most six covers and ratings at a time), and cached for a week under `~/.cache/torflix/letterboxd`.
+Each cover carries its ◆ **Letterboxd** rating out of five, in green, and so does a title's details. Letterboxd has no public API, so torflix does what [digital-drop-movies](https://digital-drop-movies.netlify.app/) does: `letterboxd.com/imdb/<id>/` redirects to the film's page, which embeds its `ratingValue` and `ratingCount` as JSON-LD. The page is ~310 KB, but gzipped it's about 43 KB — the size of a poster — so it is asked for compressed, fetched only for covers actually on screen (at most six covers and ratings at a time), and cached for a week under `~/.cache/torflix/letterboxd`.
 
 | Key (details view) | Action |
 |-----|--------|

@@ -202,8 +202,7 @@ fn draw_home_browse(f: &mut Frame, area: Rect, app: &App) {
             if focused { "Enter: open   f: star   Tab: next list   ↑: search   " } else { "↓: browse   " },
             Style::default().fg(GRAY),
         ),
-        Span::styled("★ IMDb", Style::default().fg(YELLOW)),
-        Span::styled("  ◆ Letterboxd", Style::default().fg(GREEN)),
+        Span::styled("◆ Letterboxd", Style::default().fg(GREEN)),
     ]);
     f.render_widget(Paragraph::new(title), Rect { height: 1, ..area });
 
@@ -269,14 +268,11 @@ fn draw_cover_grid(
             Paragraph::new(Span::styled(clip(&item.name, COVER_W as usize), title_style)),
             Rect { x, y: y + cover_h, width: COVER_W, height: 1 },
         );
-        // year · IMDb out of ten · Letterboxd out of five, each in its own colour.
+        // year · Letterboxd out of five, each in its own colour.
         let mut sub = vec![Span::styled(
             clip(&item.year_label(), 5),
             Style::default().fg(GRAY),
         )];
-        if let Some(r) = &item.imdb_rating {
-            sub.push(Span::styled(format!("  ★{r}"), Style::default().fg(YELLOW)));
-        }
         if let Some(lb) = app.rating(&item.id) {
             sub.push(Span::styled(format!("  ◆{:.1}", lb.score), Style::default().fg(GREEN)));
         }
@@ -735,8 +731,7 @@ fn draw_discover(f: &mut Frame, area: Rect, app: &App) {
             ),
             Style::default().fg(GRAY),
         ),
-        Span::styled("★ IMDb", Style::default().fg(YELLOW)),
-        Span::styled("  ◆ Letterboxd", Style::default().fg(GREEN)),
+        Span::styled("◆ Letterboxd", Style::default().fg(GREEN)),
     ]);
     f.render_widget(Paragraph::new(hint), Rect { height: 1, ..inner });
 
@@ -781,9 +776,6 @@ fn draw_details(f: &mut Frame, area: Rect, app: &App) {
                 let year = m.year_label();
                 if !year.is_empty() {
                     facts.push(year);
-                }
-                if let Some(r) = &m.imdb_rating {
-                    facts.push(format!("IMDb {r}"));
                 }
                 if let Load::Ready(Some(lb)) = &*d.letterboxd.lock().unwrap() {
                     facts.push(lb.label());
