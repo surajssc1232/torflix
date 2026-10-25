@@ -29,9 +29,9 @@ pub struct Rating {
 }
 
 impl Rating {
-    /// "4.2★ Letterboxd" — the form the details header shows.
+    /// "★ 4.2 Letterboxd" — the form the details header shows.
     pub fn label(&self) -> String {
-        format!("{:.1}★ Letterboxd", self.score)
+        format!("★ {:.1} Letterboxd", self.score)
     }
 }
 
@@ -154,7 +154,7 @@ mod tests {
         assert_eq!(r.score, 4.37);
         assert_eq!(r.votes, 1_850_420);
         assert_eq!(r.slug, "interstellar");
-        assert_eq!(r.label(), "4.4★ Letterboxd");
+        assert_eq!(r.label(), "★ 4.4 Letterboxd");
     }
 
     #[test]

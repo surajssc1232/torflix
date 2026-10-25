@@ -20,7 +20,7 @@ cargo install torflix
   ▞▚ covers ▚▞  ▞▚ drawn in ▚  ▞▚ half-   ▚  ▞▚ blocks  ▚
   ▞▚▞▚▞▚▞▚▞▚▞▚  ▞▚▞▚▞▚▞▚▞▚▞▚  ▞▚▞▚▞▚▞▚▞▚▞▚  ▞▚▞▚▞▚▞▚▞▚▞▚
   Hope            Spider-Man: Br…  Buddy           Obsession
-  2026 ◆3.2       2026 ◆4.0        2026 ◆3.1       2026 ◆4.1
+  2026 · ★ 3.2    2026 · ★ 4.0     2026 · ★ 3.1    2026 · ★ 4.1
  Enter: search   ↓: covers   Ctrl+P: torrents/catalog   /: commands   ?: help
 ```
 
@@ -257,7 +257,7 @@ Terminals that can't do sixel fall back to half-block characters: one character 
 
 Set `TORFLIX_SIXEL=0` to force the half-blocks, or `=1` to insist on pictures if the probe gets it wrong. Inside tmux or screen the fallback is always used. Covers are cached under `~/.cache/torflix/posters`.
 
-Each cover carries its ◆ **Letterboxd** rating out of five, in green, and so does a title's details. Letterboxd has no public API, so torflix does what [digital-drop-movies](https://digital-drop-movies.netlify.app/) does: `letterboxd.com/imdb/<id>/` redirects to the film's page, which embeds its `ratingValue` and `ratingCount` as JSON-LD. The page is ~310 KB, but gzipped it's about 43 KB — the size of a poster — so it is asked for compressed, fetched only for covers actually on screen (at most six covers and ratings at a time), and cached for a week under `~/.cache/torflix/letterboxd`.
+Each cover carries its ★ **Letterboxd** rating out of five, in green, and so does a title's details. Letterboxd has no public API, so torflix does what [digital-drop-movies](https://digital-drop-movies.netlify.app/) does: `letterboxd.com/imdb/<id>/` redirects to the film's page, which embeds its `ratingValue` and `ratingCount` as JSON-LD. The page is ~310 KB, but gzipped it's about 43 KB — the size of a poster — so it is asked for compressed, fetched only for covers actually on screen (at most six covers and ratings at a time), and cached for a week under `~/.cache/torflix/letterboxd`.
 
 | Key (details view) | Action |
 |-----|--------|

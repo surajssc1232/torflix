@@ -204,7 +204,7 @@ fn draw_home_browse(f: &mut Frame, area: Rect, app: &App) {
             if focused { "Enter: open   f: star   Tab: next list   ↑: search   " } else { "↓: browse   " },
             Style::default().fg(GRAY),
         ),
-        Span::styled("◆ Letterboxd", Style::default().fg(GREEN)),
+        Span::styled("★ Letterboxd", Style::default().fg(GREEN)),
     ]);
     f.render_widget(Paragraph::new(title), Rect { height: 1, ..area });
 
@@ -276,7 +276,8 @@ fn draw_cover_grid(
             Style::default().fg(GRAY),
         )];
         if let Some(lb) = app.rating(&item.id) {
-            sub.push(Span::styled(format!("  ◆{:.1}", lb.score), Style::default().fg(GREEN)));
+            sub.push(Span::styled(" · ", Style::default().fg(GRAY)));
+            sub.push(Span::styled(format!("★ {:.1}", lb.score), Style::default().fg(GREEN)));
         }
         f.render_widget(
             Paragraph::new(Line::from(sub)),
@@ -746,7 +747,7 @@ fn draw_discover(f: &mut Frame, area: Rect, app: &App) {
             ),
             Style::default().fg(GRAY),
         ),
-        Span::styled("◆ Letterboxd", Style::default().fg(GREEN)),
+        Span::styled("★ Letterboxd", Style::default().fg(GREEN)),
     ]);
     f.render_widget(Paragraph::new(hint), Rect { height: 1, ..inner });
 
