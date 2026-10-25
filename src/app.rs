@@ -198,6 +198,9 @@ pub struct Details {
     pub stream_selected: usize,
     /// Letterboxd's rating for the title, looked up in the background.
     pub letterboxd: Arc<Mutex<Load<Option<letterboxd::Rating>>>>,
+    /// The screen this title was opened from, so Esc goes back there rather
+    /// than to whichever list was searched last.
+    pub from: View,
 }
 
 /// Looks subtitles up right before playback, on the background thread.
@@ -1632,6 +1635,7 @@ impl App {
             streams_for: None,
             stream_selected: 0,
             letterboxd: rating,
+            from: self.view.clone(),
         });
         self.view = View::Details;
         if !series {
@@ -1763,8 +1767,15 @@ impl App {
         match self.details.as_ref().map(|d| d.pane) {
             Some(Pane::Streams) | Some(Pane::Episodes) if series => self.details_pane(false),
             _ => {
+                // Back to where it was opened from — the covers on the home
+                // screen, a catalog search, history — but never to Details
+                // itself, which would be a dead end.
+                let from = self.details.as_ref().map(|d| d.from.clone());
                 self.details = None;
-                self.view = View::Discover;
+                self.view = match from {
+                    Some(View::Details) | None => View::Discover,
+                    Some(view) => view,
+                };
             }
         }
     }
@@ -2827,6 +2838,33 @@ mod tests {
         assert!(!title_matches("The.Office.S01.Complete", "The Office", "2005–2013", true), "no episode tag");
         assert!(!title_matches("The Office", "The Office", "2005", true), "nothing after the name");
         assert!(title_matches("Grey's Anatomy S02E01", "Grey's Anatomy", "2005", true), "punctuation in the name");
+    }
+
+    /// Opening a title from the covers on the home screen and pressing Esc
+    /// has to land back on those covers, not on whatever catalog search
+    /// happened to run before it.
+    #[test]
+    fn escape_goes_back_where_the_title_was_opened_from() {
+        let mut app = App::new(Client::new("http://127.0.0.1:1"));
+        for opened_from in [View::Home, View::Discover, View::History] {
+            app.view = opened_from.clone();
+            app.details = Some(Details {
+                item: item("Spider-Man: Brand New Day", "movie", "2026"),
+                meta: Arc::new(Mutex::new(Load::Idle)),
+                pane: Pane::Streams,
+                season_idx: 0,
+                episode_idx: 0,
+                streams: Arc::new(Mutex::new(Load::Idle)),
+                streams_for: None,
+                stream_selected: 0,
+                letterboxd: Arc::new(Mutex::new(Load::Idle)),
+                from: opened_from.clone(),
+            });
+            app.view = View::Details;
+            app.details_back();
+            assert!(app.details.is_none());
+            assert!(app.view == opened_from, "came back to the wrong screen");
+        }
     }
 
     #[test]
