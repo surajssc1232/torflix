@@ -1,4 +1,6 @@
 use crate::history::{self, Kind as HistoryKind};
+use crate::letterboxd;
+use crate::posters;
 use crate::omdb;
 use crate::commands::Command as SlashCommand;
 use crate::config::SearchSource;
@@ -77,6 +79,15 @@ pub enum View {
     Tv,
     Addons,
     Settings,
+}
+
+/// Which half of the home screen the keys go to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HomeFocus {
+    /// Typing searches.
+    Search,
+    /// Arrow keys move through the covers under the search box.
+    Browse,
 }
 
 /// What the text-input popup is collecting.
@@ -172,6 +183,8 @@ pub struct Details {
     pub streams: Arc<Mutex<Load<(Vec<Stream>, Vec<String>)>>>,
     pub streams_for: Option<(usize, usize)>,
     pub stream_selected: usize,
+    /// Letterboxd's rating for the title, looked up in the background.
+    pub letterboxd: Arc<Mutex<Load<Option<letterboxd::Rating>>>>,
 }
 
 /// Looks subtitles up right before playback, on the background thread.
@@ -313,6 +326,18 @@ pub struct App {
     pub browse_idx: Option<usize>,
     pub details: Option<Details>,
 
+    // Home screen: the browse row under the search box
+    pub home_focus: HomeFocus,
+    pub home: Arc<Mutex<Load<Vec<MetaItem>>>>,
+    pub home_title: String,
+    /// Which of the browse lists the row is showing.
+    pub home_list: usize,
+    pub home_selected: usize,
+    /// Covers, keyed by url and the cell size they were decoded for.
+    pub posters: Arc<Mutex<HashMap<(String, u16, u16), Load<Option<posters::Poster>>>>>,
+    /// Columns the last cover grid drew with, so ↑/↓ can move a whole row.
+    pub grid_cols: std::cell::Cell<usize>,
+
     // Text-input popup
     pub input_purpose: InputPurpose,
     /// View to return to when the popup closes.
@@ -387,6 +412,13 @@ impl App {
             catalog_selected: 0,
             browse_idx: None,
             details: None,
+            home_focus: HomeFocus::Search,
+            home: Arc::new(Mutex::new(Load::Idle)),
+            home_title: String::new(),
+            home_list: 0,
+            home_selected: 0,
+            posters: Arc::new(Mutex::new(HashMap::new())),
+            grid_cols: std::cell::Cell::new(1),
             input_purpose: InputPurpose::Torrent,
             input_return: View::Torrents,
             pending_download: None,
@@ -1334,6 +1366,102 @@ impl App {
     }
 
     /// Show one of the /browse lists.
+    /// Fill the row of covers under the search box. Called once at startup and
+    /// again when the list is cycled.
+    pub fn load_home(&mut self, which: usize) {
+        let targets = stremio::browse_targets(&self.addons);
+        if targets.is_empty() {
+            return; // Cinemeta disabled — the home screen is just the search box
+        }
+        let which = which % targets.len();
+        self.home_list = which;
+        self.home_selected = 0;
+        let target = targets[which].clone();
+        self.home_title = target.label.to_lowercase();
+        let slot = Arc::new(Mutex::new(Load::Loading));
+        self.home = Arc::clone(&slot);
+        thread::spawn(move || {
+            let result = match stremio::catalog(&target) {
+                Ok(items) => Load::Ready(items),
+                Err(e) => Load::Failed(format!("{e:#}")),
+            };
+            *slot.lock().unwrap() = result;
+        });
+    }
+
+    /// Tab while the covers have focus: the next browse list.
+    pub fn home_next_list(&mut self) {
+        self.load_home(self.home_list + 1);
+    }
+
+    pub fn home_items(&self) -> Vec<MetaItem> {
+        match &*self.home.lock().unwrap() {
+            Load::Ready(v) => v.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// ↓ from the search box, when there is something to move into.
+    pub fn focus_browse(&mut self) -> bool {
+        if self.home_items().is_empty() {
+            return false;
+        }
+        self.home_focus = HomeFocus::Browse;
+        true
+    }
+
+    /// Move through the covers; `delta` of ±1 steps sideways, ±columns a row.
+    /// Going up off the top row puts the cursor back in the search box.
+    pub fn home_move(&mut self, delta: isize) {
+        let n = self.home_items().len();
+        if n == 0 {
+            return;
+        }
+        let next = self.home_selected as isize + delta;
+        if next < 0 {
+            self.home_focus = HomeFocus::Search;
+            return;
+        }
+        self.home_selected = (next as usize).min(n - 1);
+    }
+
+    pub fn open_home_selected(&mut self) {
+        let items = self.home_items();
+        if let Some(item) = items.get(self.home_selected) {
+            self.open_details_for(item.clone());
+        }
+    }
+
+    /// The cover for `url` at this size, starting the fetch the first time it's
+    /// asked for. `None` until it's decoded — the grid draws a placeholder.
+    pub fn poster(&self, url: &str, w: u16, h: u16) -> Option<posters::Poster> {
+        let key = (url.to_string(), w, h);
+        {
+            let mut cache = self.posters.lock().unwrap();
+            match cache.get(&key) {
+                Some(Load::Ready(p)) => return p.clone(),
+                Some(_) => return None, // already on its way, or given up on
+                None => cache.insert(key.clone(), Load::Loading),
+            };
+        }
+        let (slot, url) = (Arc::clone(&self.posters), url.to_string());
+        thread::spawn(move || {
+            let decoded = posters::load(&url, w, h);
+            slot.lock().unwrap().insert(key, Load::Ready(decoded));
+        });
+        None
+    }
+
+    /// Move through the catalog grid, the same way as the home row.
+    pub fn catalog_move(&mut self, delta: isize) {
+        let n = self.catalog_len();
+        if n == 0 {
+            return;
+        }
+        let next = (self.catalog_selected as isize + delta).max(0) as usize;
+        self.catalog_selected = next.min(n - 1);
+    }
+
     pub fn open_browse(&mut self, which: usize) {
         let targets = stremio::browse_targets(&self.addons);
         if targets.is_empty() {
@@ -1406,6 +1534,16 @@ impl App {
             };
             *slot.lock().unwrap() = result;
         });
+        // Letterboxd rates films, not episodes, so the title's own id is enough.
+        let rating = Arc::new(Mutex::new(Load::Loading));
+        let (slot, imdb_id) = (Arc::clone(&rating), item.id.clone());
+        thread::spawn(move || {
+            let result = match letterboxd::fetch(&imdb_id) {
+                Ok(r) => Load::Ready(r),
+                Err(e) => Load::Failed(format!("{e:#}")),
+            };
+            *slot.lock().unwrap() = result;
+        });
         let series = item.is_series();
         self.details = Some(Details {
             item,
@@ -1416,6 +1554,7 @@ impl App {
             streams: Arc::new(Mutex::new(Load::Idle)),
             streams_for: None,
             stream_selected: 0,
+            letterboxd: rating,
         });
         self.view = View::Details;
         if !series {
@@ -1666,6 +1805,7 @@ impl App {
     pub fn toggle_favorite(&mut self) {
         let item = match self.view {
             View::Details => self.details.as_ref().map(|d| d.item.clone()),
+            View::Home => self.home_items().get(self.home_selected).cloned(),
             _ => self.selected_catalog_item(),
         };
         let Some(item) = item else { return };
@@ -2405,6 +2545,18 @@ fn spawn_player(player_cmd: &str, url: &str, title: &str, opts: &PlayOpts) -> st
 
 /// A folder name for a download, safe on every platform: no path separators or
 /// characters Windows rejects, no trailing dots or spaces, and not a reserved name.
+/// Where to find a title's cover. Cinemeta gives one for catalog entries;
+/// anything else carrying an IMDb id (favorites, for one) can be looked up by
+/// that id instead.
+pub fn poster_url(item: &MetaItem) -> Option<String> {
+    if let Some(p) = item.poster.as_ref().filter(|p| !p.is_empty()) {
+        return Some(p.clone());
+    }
+    item.id
+        .starts_with("tt")
+        .then(|| format!("https://images.metahub.space/poster/small/{}/img", item.id))
+}
+
 /// Move a torrent's files from `root` into `dest`, keeping the layout the
 /// torrent gave them, and clear up the directories they leave empty behind.
 /// Returns how many files were moved.

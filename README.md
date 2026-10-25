@@ -12,20 +12,16 @@ cargo install torflix
 
 ```
  ▶ torflix  stream torrents in your terminal           engine: online
-┌──────────────────────────────────────────────────────────────────────┐
-│                                                                      │
-│   ████████╗ ██████╗ ██████╗ ███████╗██╗     ██╗██╗  ██╗            │
-│      ██╔══╝██╔═══██╗██╔══██╗██╔════╝██║     ██║╚██╗██╔╝            │
-│      ██║   ██║   ██║██████╔╝█████╗  ██║     ██║ ╚███╔╝             │
-│      ██║   ██║   ██║██╔══██╗██╔══╝  ██║     ██║ ██╔██╗             │
-│      ██║   ╚██████╔╝██║  ██║██║     ███████╗██║██╔╝ ██╗            │
-│      ╚═╝    ╚═════╝ ╚═╝  ╚═╝╚═╝     ╚══════╝╚═╝╚═╝  ╚═╝           │
-│                                                                      │
-│    › breaking bad s03______                                          │
-│                                                                      │
-│      Tab: downloads   q: quit (from downloads)                      │
-└──────────────────────────────────────────────────────────────────────┘
- Enter: search   Tab: downloads   Esc: clear   ?: help
+ ┌ catalog · Ctrl+P ───────────────────────────────────────────────────┐
+ │  › breaking bad s03█                                                │
+ └─────────────────────────────────────────────────────────────────────┘
+  popular movies  ↓: browse
+  ▞▚▞▚▞▚▞▚▞▚▞▚  ▞▚▞▚▞▚▞▚▞▚▞▚  ▞▚▞▚▞▚▞▚▞▚▞▚  ▞▚▞▚▞▚▞▚▞▚▞▚
+  ▞▚ covers ▚▞  ▞▚ drawn in ▚  ▞▚ half-   ▚  ▞▚ blocks  ▚
+  ▞▚▞▚▞▚▞▚▞▚▞▚  ▞▚▞▚▞▚▞▚▞▚▞▚  ▞▚▞▚▞▚▞▚▞▚▞▚  ▞▚▞▚▞▚▞▚▞▚▞▚
+  Hope          Spider-Man: …  Buddy         Obsession
+  2026  ★ 6.9   2026  ★ 8.0    2026  ★ 7.1   2026  ★ 7.8
+ Enter: search   ↓: covers   Ctrl+P: torrents/catalog   /: commands   ?: help
 ```
 
 ```
@@ -98,6 +94,7 @@ torflix -d /mnt/nas/movies "magnet:?xt=urn:btih:..."
 | `Ctrl+U` | clear query |
 | `Tab` | go to downloads view |
 | `Ctrl+P` | switch what the box searches: torrents ↔ catalog |
+| `↓` | move into the covers below the search box |
 | `Ctrl+J` | downloads (from any screen) |
 | `Ctrl+H` | history (from any screen) |
 | `/` | slash commands (`/browse`, `/favorites`, `/tv`, …) |
@@ -252,6 +249,10 @@ When streaming from a multi-file torrent (a season pack, say), torflix fetches o
 ## Catalog mode, subtitles & resume
 
 Press `Ctrl+P` on the home screen to search the **catalog** instead of torrent indexers. It uses [Stremio addons](https://github.com/Stremio/stremio-addon-sdk): titles, posters and ratings come from Cinemeta, and a series opens with its seasons and episodes.
+
+Covers are drawn with half-block characters — one character cell carries two pixels, its foreground colour painting the top and its background the bottom — so they need no terminal graphics protocol and work anywhere 24-bit colour does. They're cached under `~/.cache/torflix/posters`.
+
+Alongside IMDb, a title's details show its **Letterboxd** rating out of 5. Letterboxd has no public API, so torflix does what [digital-drop-movies](https://digital-drop-movies.netlify.app/) does: `letterboxd.com/imdb/<id>/` redirects to the film's page, which embeds its `ratingValue` and `ratingCount` as JSON-LD. Answers are cached for a week under `~/.cache/torflix/letterboxd`.
 
 | Key (details view) | Action |
 |-----|--------|

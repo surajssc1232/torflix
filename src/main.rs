@@ -4,7 +4,9 @@ mod config;
 mod daemon;
 mod favorites;
 mod history;
+mod letterboxd;
 mod omdb;
+mod posters;
 mod progress;
 mod rqbit;
 mod search;
@@ -13,7 +15,7 @@ mod tv;
 mod ui;
 
 use anyhow::Result;
-use app::{App, InputPurpose, View};
+use app::{App, HomeFocus, InputPurpose, View};
 use crossterm::{
     event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
@@ -103,6 +105,8 @@ fn main() -> Result<()> {
         app.status = "connected to background engine — downloads kept going while torflix was closed".into();
     }
     app.spawn_poller();
+    // The home screen shows covers from the first browse list; start fetching now.
+    app.load_home(0);
 
     // Add magnet/URL/.torrent paths passed on the command line.
     for arg in positional {
@@ -222,8 +226,31 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                 }
                 let n_rows = app.rows_snapshot().len();
                 match app.view {
+                    View::Home if app.home_focus == HomeFocus::Browse => match key.code {
+                        KeyCode::Up => app.home_move(-(app.grid_cols.get() as isize)),
+                        KeyCode::Down => app.home_move(app.grid_cols.get() as isize),
+                        KeyCode::Left => app.home_move(-1),
+                        KeyCode::Right => app.home_move(1),
+                        KeyCode::Enter => app.open_home_selected(),
+                        KeyCode::Tab => app.home_next_list(),
+                        KeyCode::Char('f') => app.toggle_favorite(),
+                        KeyCode::Esc => app.home_focus = HomeFocus::Search,
+                        // Anything typed belongs in the search box, so go back to it.
+                        KeyCode::Char(c) => {
+                            app.home_focus = HomeFocus::Search;
+                            app.search_query.push(c);
+                        }
+                        KeyCode::Backspace => {
+                            app.home_focus = HomeFocus::Search;
+                            app.search_query.pop();
+                        }
+                        _ => {}
+                    },
                     View::Home => {
                         match key.code {
+                            KeyCode::Down => {
+                                app.focus_browse();
+                            }
                             KeyCode::Enter => app.submit_home(),
                             KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                 app.toggle_search_source();
@@ -344,14 +371,13 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                         KeyCode::Esc | KeyCode::Char('h') => app.view = View::Home,
                         KeyCode::Char('q') => app.request_quit(),
                         KeyCode::Up | KeyCode::Char('k') => {
-                            app.catalog_selected = app.catalog_selected.saturating_sub(1);
+                            app.catalog_move(-(app.grid_cols.get() as isize));
                         }
                         KeyCode::Down | KeyCode::Char('j') => {
-                            let n = app.catalog_len();
-                            if n > 0 {
-                                app.catalog_selected = (app.catalog_selected + 1).min(n - 1);
-                            }
+                            app.catalog_move(app.grid_cols.get() as isize);
                         }
+                        KeyCode::Left => app.catalog_move(-1),
+                        KeyCode::Right => app.catalog_move(1),
                         KeyCode::Enter | KeyCode::Char('l') => app.open_details(),
                         KeyCode::Char('d') => app.download_catalog_selected(false),
                         KeyCode::Char('D') => app.download_catalog_selected(true),

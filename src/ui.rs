@@ -1,5 +1,7 @@
-use crate::app::{human_bytes, is_video, progress_size, App, Details, FileSortMode, InputPurpose, Load, Pane, PreviewState, SearchPreview, SearchStatus, SortMode, View};
+use crate::app::{human_bytes, is_video, poster_url, progress_size, HomeFocus, App, Details, FileSortMode, InputPurpose, Load, Pane, PreviewState, SearchPreview, SearchStatus, SortMode, View};
 use crate::history;
+use crate::posters;
+use crate::stremio::MetaItem;
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -22,9 +24,8 @@ pub fn draw(f: &mut Frame, app: &App) {
     let area = f.size();
     f.render_widget(Block::default().style(Style::default().bg(BG).fg(FG)), area);
 
-    // Home needs 14 rows (title + 11-row logo/search block + status + help) and
-    // its search bar is at least 20 columns wide. Smaller than that, bordered
-    // widgets land outside the buffer and ratatui 0.26 panics, so say so instead.
+    // Below this, bordered widgets land outside the buffer and ratatui 0.26
+    // panics, so say so instead of drawing.
     if area.width < 20 || area.height < 14 {
         if area.width > 0 && area.height > 0 {
             f.render_widget(
@@ -101,64 +102,25 @@ fn draw_title(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(line), area);
 }
 
-const ASCII_ART: &[&str] = &[
-    "████████╗ ██████╗ ██████╗ ███████╗██╗     ██╗██╗  ██╗",
-    "   ██╔══╝██╔═══██╗██╔══██╗██╔════╝██║     ██║╚██╗██╔╝",
-    "   ██║   ██║   ██║██████╔╝█████╗  ██║     ██║ ╚███╔╝ ",
-    "   ██║   ██║   ██║██╔══██╗██╔══╝  ██║     ██║ ██╔██╗ ",
-    "   ██║   ╚██████╔╝██║  ██║██║     ███████╗██║██╔╝ ██╗",
-    "   ╚═╝    ╚═════╝ ╚═╝  ╚═╝╚═╝     ╚══════╝╚═╝╚═╝  ╚═╝",
-];
 
 fn draw_home(f: &mut Frame, area: Rect, app: &App) {
-    // Vertical layout: spacer | art | gap | search bar | spacer
-    let art_height = ASCII_ART.len() as u16;
+    let searching = app.home_focus == HomeFocus::Search;
     let bar_height = 3u16; // border + 1 content row + border
-    let gap = 2u16;
-    let total = art_height + gap + bar_height;
 
-    // Center the block vertically
-    let top_pad = area.height.saturating_sub(total) / 2;
-
+    // Search box across the top, covers filling what is left below it.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(top_pad),
-            Constraint::Length(art_height),
-            Constraint::Length(gap),
-            Constraint::Length(bar_height),
-            Constraint::Min(0),
-        ])
+        .constraints([Constraint::Length(bar_height), Constraint::Min(0)])
         .split(area);
 
-    // ASCII art — wave animation: one row glows ORANGE, rest stay YELLOW.
-    // Sweeps down every 2 ticks (≈500 ms), then pauses at bottom before repeating.
-    let n_rows = ASCII_ART.len() as u64;
-    let period = n_rows + 3; // extra ticks of "pause" after the last row
-    let wave_row = (app.tick / 2) % period;
-    let art_lines: Vec<Line> = ASCII_ART
-        .iter()
-        .enumerate()
-        .map(|(i, l)| {
-            let color = if wave_row < n_rows && i as u64 == wave_row {
-                ORANGE
-            } else {
-                YELLOW
-            };
-            Line::from(Span::styled(*l, Style::default().fg(color).add_modifier(Modifier::BOLD)))
-        })
-        .collect();
-    f.render_widget(
-        Paragraph::new(art_lines).alignment(Alignment::Center),
-        chunks[1],
-    );
+    let bar_rect = Rect {
+        x: area.x + 1,
+        y: chunks[0].y,
+        width: area.width.saturating_sub(2),
+        height: bar_height,
+    };
 
-    // Search bar — centered horizontally
-    let bar_width = area.width.min(60).max(20);
-    let bar_x = area.x + area.width.saturating_sub(bar_width) / 2;
-    let bar_rect = Rect { x: bar_x, y: chunks[3].y, width: bar_width, height: bar_height };
-
-    let inner_w = bar_width.saturating_sub(6) as usize;
+    let inner_w = bar_rect.width.saturating_sub(6) as usize;
     let q = &app.search_query;
     let shown: String = if q.chars().count() > inner_w {
         q.chars().skip(q.chars().count() - inner_w).collect()
@@ -166,20 +128,25 @@ fn draw_home(f: &mut Frame, area: Rect, app: &App) {
         q.clone()
     };
 
-    let p = Paragraph::new(vec![
-        Line::from(if q.is_empty() {
-            vec![
-                Span::styled("  › ", Style::default().fg(AQUA).add_modifier(Modifier::BOLD)),
-                Span::styled("search for a movie or show…  (/ for commands)", Style::default().fg(GRAY)),
-            ]
-        } else {
-            vec![
-                Span::styled("  › ", Style::default().fg(AQUA).add_modifier(Modifier::BOLD)),
-                Span::styled(shown, Style::default().fg(FG)),
-                Span::styled("█", Style::default().fg(AQUA)),
-            ]
-        }),
-    ])
+    let p = Paragraph::new(vec![Line::from(if q.is_empty() {
+        vec![
+            Span::styled("  › ", Style::default().fg(AQUA).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                if searching {
+                    "search for a movie or show…  (/ for commands, ↓ for the covers)"
+                } else {
+                    "↑ or any letter comes back here to search"
+                },
+                Style::default().fg(GRAY),
+            ),
+        ]
+    } else {
+        vec![
+            Span::styled("  › ", Style::default().fg(AQUA).add_modifier(Modifier::BOLD)),
+            Span::styled(shown, Style::default().fg(FG)),
+            Span::styled(if searching { "█" } else { "" }, Style::default().fg(AQUA)),
+        ]
+    })])
     .block(
         Block::default()
             .borders(Borders::ALL)
@@ -187,18 +154,16 @@ fn draw_home(f: &mut Frame, area: Rect, app: &App) {
                 format!(" {} · Ctrl+P ", app.config.search_source.label()),
                 Style::default().fg(YELLOW),
             ))
-            .border_style(Style::default().fg(if q.is_empty() { GRAY } else { AQUA })),
+            .border_style(Style::default().fg(if searching { AQUA } else { GRAY })),
     );
     f.render_widget(p, bar_rect);
 
-    // Slash-command suggestions while typing "/…"
+    // Slash-command suggestions take the place of the covers while typing "/…".
     let suggestions = crate::commands::Command::suggest(q);
     if !suggestions.is_empty() {
-        let top = bar_rect.y + bar_height;
-        let room = (area.y + area.height).saturating_sub(top) as usize;
         let lines: Vec<Line> = suggestions
             .iter()
-            .take(room)
+            .take(chunks[1].height as usize)
             .map(|c| {
                 Line::from(vec![
                     Span::styled(format!("  {:<11}", c.name()), Style::default().fg(YELLOW)),
@@ -206,27 +171,169 @@ fn draw_home(f: &mut Frame, area: Rect, app: &App) {
                 ])
             })
             .collect();
-        if !lines.is_empty() {
-            let rect = Rect { x: bar_rect.x, y: top, width: bar_rect.width, height: lines.len() as u16 };
-            f.render_widget(Paragraph::new(lines), rect);
-        }
+        f.render_widget(Paragraph::new(lines), chunks[1]);
+        return;
     }
 
-    // Hint below search bar when empty
-    if q.is_empty() {
-        let hint_y = bar_rect.y + bar_height;
-        if hint_y < area.y + area.height {
-            let hint_rect = Rect { x: area.x, y: hint_y, width: area.width, height: 1 };
+    draw_home_browse(f, chunks[1], app);
+}
+
+/// The covers under the search box: whichever browse list is showing.
+fn draw_home_browse(f: &mut Frame, area: Rect, app: &App) {
+    if area.height < 4 {
+        return;
+    }
+    let focused = app.home_focus == HomeFocus::Browse;
+    let items = app.home_items();
+    let note = match &*app.home.lock().unwrap() {
+        Load::Ready(v) if v.is_empty() => Some(("nothing to show".to_string(), GRAY)),
+        Load::Failed(e) => Some((format!("✗ {e}"), RED)),
+        Load::Idle => Some(("".to_string(), GRAY)),
+        Load::Loading => Some(("loading…".to_string(), YELLOW)),
+        Load::Ready(_) => None,
+    };
+
+    let title = Line::from(vec![
+        Span::styled(
+            format!("  {}  ", if app.home_title.is_empty() { "browse" } else { &app.home_title }),
+            Style::default().fg(YELLOW).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            if focused { "Enter: open   f: star   Tab: next list   ↑: search" } else { "↓: browse" },
+            Style::default().fg(GRAY),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(title), Rect { height: 1, ..area });
+
+    let grid = Rect {
+        x: area.x + 1,
+        y: area.y + 1,
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(1),
+    };
+    if let Some((msg, color)) = note {
+        f.render_widget(
+            Paragraph::new(Span::styled(msg, Style::default().fg(color))),
+            Rect { height: 1, ..grid },
+        );
+        return;
+    }
+    let cols = draw_cover_grid(f, grid, app, &items, app.home_selected, focused);
+    app.grid_cols.set(cols);
+}
+
+/// Cells across for one cover. Narrow enough that a modest terminal still
+/// fits several, wide enough that the picture reads.
+const COVER_W: u16 = 14;
+
+/// A grid of covers with their titles. Returns the number of columns used, so
+/// ↑/↓ can move a whole row at a time.
+fn draw_cover_grid(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    items: &[MetaItem],
+    selected: usize,
+    focused: bool,
+) -> usize {
+    let cover_h = posters::height_for(COVER_W);
+    let tile_h = cover_h + 2; // cover, title, year · rating
+    let (stride_x, stride_y) = (COVER_W + 2, tile_h + 1);
+    let cols = (area.width / stride_x).max(1) as usize;
+    let rows = (area.height / stride_y).max(1) as usize;
+
+    // Scroll by whole rows, keeping the selected cover on screen.
+    let sel_row = selected / cols;
+    let first_row = sel_row.saturating_sub(rows.saturating_sub(1));
+
+    for slot in 0..rows * cols {
+        let idx = (first_row + slot / cols) * cols + slot % cols;
+        let Some(item) = items.get(idx) else { break };
+        let x = area.x + (slot % cols) as u16 * stride_x;
+        let y = area.y + (slot / cols) as u16 * stride_y;
+        if x + COVER_W > area.x + area.width || y + tile_h > area.y + area.height {
+            continue;
+        }
+        let picked = idx == selected;
+        draw_cover(f, Rect { x, y, width: COVER_W, height: cover_h }, app, item, picked && focused);
+
+        let title_style = if picked {
+            Style::default().fg(if focused { BG } else { YELLOW }).bg(if focused { YELLOW } else { BG })
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(FG)
+        };
+        f.render_widget(
+            Paragraph::new(Span::styled(clip(&item.name, COVER_W as usize), title_style)),
+            Rect { x, y: y + cover_h, width: COVER_W, height: 1 },
+        );
+        let mut sub = item.year_label();
+        if let Some(r) = &item.imdb_rating {
+            sub = if sub.is_empty() { format!("★ {r}") } else { format!("{sub}  ★ {r}") };
+        }
+        f.render_widget(
+            Paragraph::new(Span::styled(clip(&sub, COVER_W as usize), Style::default().fg(GRAY))),
+            Rect { x, y: y + cover_h + 1, width: COVER_W, height: 1 },
+        );
+    }
+    cols
+}
+
+/// One cover, as half-block rows. Until it has been fetched and decoded — or
+/// when there is no picture to be had — a muted panel with the title stands in.
+fn draw_cover(f: &mut Frame, area: Rect, app: &App, item: &MetaItem, picked: bool) {
+    let cover = poster_url(item).and_then(|u| app.poster(&u, area.width, area.height));
+    match cover {
+        Some(p) => {
+            let lines: Vec<Line> = p
+                .rows
+                .iter()
+                .map(|row| {
+                    Line::from(
+                        row.iter()
+                            .map(|((tr, tg, tb), (br, bg, bb))| {
+                                Span::styled(
+                                    "▀",
+                                    Style::default()
+                                        .fg(Color::Rgb(*tr, *tg, *tb))
+                                        .bg(Color::Rgb(*br, *bg, *bb)),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect();
+            f.render_widget(Paragraph::new(lines), area);
+        }
+        None => {
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(if picked { YELLOW } else { GRAY }));
             f.render_widget(
-                Paragraph::new(Span::styled(
-                    "Ctrl+P: torrents/catalog   /browse  /favorites  /history   Tab: downloads",
-                    Style::default().fg(GRAY),
-                ))
-                .alignment(Alignment::Center),
-                hint_rect,
+                Paragraph::new(Span::styled(item.name.clone(), Style::default().fg(GRAY)))
+                    .wrap(Wrap { trim: true })
+                    .alignment(Alignment::Center)
+                    .block(block),
+                area,
             );
         }
     }
+    if picked {
+        // A bar down the left edge, so the pick is obvious even over a picture.
+        let marks: Vec<Line> = (0..area.height)
+            .map(|_| Line::from(Span::styled("▌", Style::default().fg(YELLOW))))
+            .collect();
+        f.render_widget(Paragraph::new(marks), Rect { width: 1, ..area });
+    }
+}
+
+/// Cut to `width` columns, with an ellipsis when something had to go.
+fn clip(s: &str, width: usize) -> String {
+    if s.chars().count() <= width {
+        return s.to_string();
+    }
+    let keep = width.saturating_sub(1);
+    format!("{}…", s.chars().take(keep).collect::<String>())
 }
 
 fn progress_bar_spans(pct: f64, width: usize) -> Line<'static> {
@@ -388,8 +495,8 @@ fn status_style(status: &str) -> (String, Style) {
 
 fn draw_help(f: &mut Frame, area: Rect, app: &App) {
     let help: &str = match app.view {
-        View::Home          => " Enter: search   Ctrl+P: torrents/catalog   /: commands   Ctrl+J: downloads   Ctrl+H: history   q: quit   ?: help",
-        View::Discover      => " Enter: open   d: download   D: download to…   f: star   b: next list   Esc: back   q: quit",
+        View::Home          => " Enter: search   ↓: covers   Ctrl+P: torrents/catalog   /: commands   Ctrl+J: downloads   Ctrl+H: history   ?: help",
+        View::Discover      => " ←→↑↓: move   Enter: open   d: download   D: download to…   f: star   b: next list   Esc: back",
         View::Details       => " Enter: select/play   Tab: next pane   d: download   D: download to…   f: star   t: torrents   Esc: back",
         View::Tv if app.tv_filter_active
                             => " type: filter channels   Enter: keep   Esc: clear",
@@ -443,10 +550,17 @@ fn draw_help_popup(f: &mut Frame, area: Rect) {
         section("Home / Search"),
         row("type",        "type to build search query"),
         row("Enter",       "search for the typed query"),
+        row("↓",           "move into the covers under the search box"),
         row("Esc",         "clear search query"),
         row("Tab",         "go to downloads view"),
         row("Ctrl+P",      "switch search: torrents ↔ catalog (Stremio)"),
         row("/",           "commands: /browse /favorites /history /tidy …"),
+        Line::from(""),
+        section("Covers (home row, /browse, catalog results)"),
+        row("←→↑↓",        "move between covers"),
+        row("Enter",       "open the title"),
+        row("f",           "star / unstar"),
+        row("Tab / b",     "next browse list (home row / browse page)"),
         Line::from(""),
         section("Catalog list & details"),
         row("Enter",       "open title · pick season/episode · play stream"),
@@ -586,41 +700,36 @@ fn draw_discover(f: &mut Frame, area: Rect, app: &App) {
         .borders(Borders::ALL)
         .title(format!(" {} ", app.catalog_title))
         .border_style(Style::default().fg(GRAY));
-    let catalog = app.catalog.lock().unwrap();
-    let items = match &*catalog {
-        Load::Ready(items) if !items.is_empty() => items,
-        Load::Ready(_) if app.catalog_title == "favorites" => {
-            return centered_message(f, area, block, "no favorites yet — press f on a title to star it".into(), GRAY);
+    let items = {
+        let catalog = app.catalog.lock().unwrap();
+        match &*catalog {
+            Load::Ready(items) if !items.is_empty() => items.clone(),
+            Load::Ready(_) if app.catalog_title == "favorites" => {
+                return centered_message(f, area, block, "no favorites yet — press f on a title to star it".into(), GRAY);
+            }
+            Load::Ready(_) => return centered_message(f, area, block, "nothing found".into(), GRAY),
+            Load::Failed(e) => return centered_message(f, area, block, format!("✗ {e}"), RED),
+            Load::Idle | Load::Loading => return centered_message(f, area, block, "loading…".into(), YELLOW),
         }
-        Load::Ready(_) => return centered_message(f, area, block, "nothing found".into(), GRAY),
-        Load::Failed(e) => return centered_message(f, area, block, format!("✗ {e}"), RED),
-        Load::Idle | Load::Loading => return centered_message(f, area, block, "loading…".into(), YELLOW),
     };
 
-    let rows: Vec<Row> = items
-        .iter()
-        .map(|m| {
-            let (kind, color) = if m.is_series() { ("series", AQUA) } else { ("movie", ORANGE) };
-            Row::new(vec![
-                Cell::from(if app.is_favorite(&m.id) { "★" } else { "" }).style(Style::default().fg(YELLOW)),
-                Cell::from(m.name.clone()),
-                Cell::from(m.year_label()).style(Style::default().fg(GRAY)),
-                Cell::from(kind).style(Style::default().fg(color)),
-                Cell::from(m.imdb_rating.clone().unwrap_or_default()).style(Style::default().fg(YELLOW)),
-            ])
-        })
-        .collect();
-    let table = Table::new(
-        rows,
-        [Constraint::Length(2), Constraint::Min(20), Constraint::Length(10), Constraint::Length(7), Constraint::Length(5)],
-    )
-    .header(Row::new(vec!["", "title", "year", "type", "imdb"]).style(Style::default().fg(YELLOW).add_modifier(Modifier::BOLD)))
-    .block(block)
-    .highlight_style(highlight())
-    .highlight_symbol("▶ ");
-    let mut state = TableState::default();
-    state.select(Some(app.catalog_selected.min(items.len() - 1)));
-    f.render_stateful_widget(table, area, &mut state);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let starred = app.is_favorite(&items[app.catalog_selected.min(items.len() - 1)].id);
+    let hint = Line::from(Span::styled(
+        format!(
+            "  {} of {}   Enter: open   f: {}   b: next list   ←→↑↓: move",
+            app.catalog_selected + 1,
+            items.len(),
+            if starred { "unstar" } else { "star" }
+        ),
+        Style::default().fg(GRAY),
+    ));
+    f.render_widget(Paragraph::new(hint), Rect { height: 1, ..inner });
+
+    let grid = Rect { y: inner.y + 1, height: inner.height.saturating_sub(1), ..inner };
+    let cols = draw_cover_grid(f, grid, app, &items, app.catalog_selected, true);
+    app.grid_cols.set(cols);
 }
 
 fn pane_list(f: &mut Frame, area: Rect, title: String, items: Vec<ListItem>, selected: usize, focused: bool) {
@@ -663,6 +772,9 @@ fn draw_details(f: &mut Frame, area: Rect, app: &App) {
                 if let Some(r) = &m.imdb_rating {
                     facts.push(format!("IMDb {r}"));
                 }
+                if let Load::Ready(Some(lb)) = &*d.letterboxd.lock().unwrap() {
+                    facts.push(lb.label());
+                }
                 if let Some(rt) = &m.runtime {
                     facts.push(rt.clone());
                 }
@@ -687,12 +799,19 @@ fn draw_details(f: &mut Frame, area: Rect, app: &App) {
         Line::from(Span::styled(facts.join("  ·  "), Style::default().fg(AQUA))),
         extra,
     ];
-    f.render_widget(
-        Paragraph::new(header)
-            .wrap(Wrap { trim: true })
-            .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(GRAY))),
-        chunks[0],
-    );
+    let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(GRAY));
+    let inner = block.inner(chunks[0]);
+    f.render_widget(block, chunks[0]);
+    // The title's own cover alongside the facts, when it fits.
+    let cover_w = 8u16;
+    let text = if inner.width > cover_w * 3 && inner.height >= 4 {
+        let cover = Rect { width: cover_w, height: inner.height, ..inner };
+        draw_cover(f, cover, app, &d.item, false);
+        Rect { x: inner.x + cover_w + 2, width: inner.width - cover_w - 2, ..inner }
+    } else {
+        inner
+    };
+    f.render_widget(Paragraph::new(header).wrap(Wrap { trim: true }), text);
 
     let streams_area = if series {
         let cols = Layout::default()
