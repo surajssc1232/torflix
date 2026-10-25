@@ -8,9 +8,10 @@
 //! asks Letterboxd directly: `letterboxd.com/imdb/<id>/` redirects to the film
 //! page, and Cinemeta already gives us IMDb ids.
 //!
-//! One page is ~320 KB, so answers are cached on disk for a week. The lighter
-//! `/csi/film/<slug>/rating-histogram/` endpoint is behind a Cloudflare
-//! challenge and can't be used.
+//! The page is ~310 KB, but gzipped it's about 43 KB — the size of a poster —
+//! so it's asked for compressed, and answers are cached on disk for a week.
+//! The lighter `/csi/film/<slug>/rating-histogram/`, `/esi/…` and poster-ajax
+//! endpoints are all behind a Cloudflare challenge and can't be used.
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
@@ -70,6 +71,7 @@ pub fn fetch(imdb_id: &str) -> Result<Option<Rating>> {
     }
 
     let resp = minreq::get(format!("https://letterboxd.com/imdb/{imdb_id}/"))
+        .with_header("Accept-Encoding", "gzip")
         .with_timeout(20)
         .send()?;
     if resp.status_code == 404 {
@@ -79,8 +81,8 @@ pub fn fetch(imdb_id: &str) -> Result<Option<Rating>> {
     if resp.status_code >= 400 {
         return Err(anyhow!("letterboxd returned HTTP {}", resp.status_code));
     }
-    let body = resp.as_str()?;
-    let rating = parse(body, &resp.url);
+    let body = gunzip(resp.as_bytes());
+    let rating = parse(&body, &resp.url);
     crate::config::write_json(
         &path,
         &Cached {
@@ -91,6 +93,18 @@ pub fn fetch(imdb_id: &str) -> Result<Option<Rating>> {
         },
     );
     Ok(rating)
+}
+
+/// Undo the gzip Letterboxd was asked for. Anything that isn't gzipped is
+/// already the page itself.
+fn gunzip(body: &[u8]) -> String {
+    if body.starts_with(&[0x1f, 0x8b]) {
+        let mut out = String::new();
+        if std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(body), &mut out).is_ok() {
+            return out;
+        }
+    }
+    String::from_utf8_lossy(body).into_owned()
 }
 
 /// Pull the rating out of the film page's JSON-LD, with the slug from the URL
@@ -148,6 +162,14 @@ mod tests {
         assert!(parse("<html>no ratings yet</html>", "https://letterboxd.com/film/x/").is_none());
         // A film nobody has rated still has a count of 0 and no value.
         assert!(parse(r#"{"ratingCount":0}"#, "https://letterboxd.com/film/x/").is_none());
+    }
+
+    #[test]
+    fn gzipped_and_plain_pages_both_read() {
+        assert!(gunzip(PAGE.as_bytes()).contains("ratingValue"));
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut enc, PAGE.as_bytes()).unwrap();
+        assert_eq!(gunzip(&enc.finish().unwrap()), PAGE);
     }
 
     #[test]

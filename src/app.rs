@@ -335,6 +335,11 @@ pub struct App {
     pub home_selected: usize,
     /// Covers, keyed by url and the cell size they were decoded for.
     pub posters: Arc<Mutex<HashMap<(String, u16, u16), Load<Option<posters::Poster>>>>>,
+    /// Letterboxd ratings for titles on screen, keyed by IMDb id.
+    pub lb_ratings: Arc<Mutex<HashMap<String, Load<Option<letterboxd::Rating>>>>>,
+    /// Covers and ratings being fetched right now, so a screenful of tiles
+    /// doesn't open thirty connections at once. The rest start on later frames.
+    inflight: Arc<std::sync::atomic::AtomicUsize>,
     /// Columns the last cover grid drew with, so ↑/↓ can move a whole row.
     pub grid_cols: std::cell::Cell<usize>,
 
@@ -418,6 +423,8 @@ impl App {
             home_list: 0,
             home_selected: 0,
             posters: Arc::new(Mutex::new(HashMap::new())),
+            lb_ratings: Arc::new(Mutex::new(HashMap::new())),
+            inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             grid_cols: std::cell::Cell::new(1),
             input_purpose: InputPurpose::Torrent,
             input_return: View::Torrents,
@@ -1432,22 +1439,68 @@ impl App {
         }
     }
 
+    /// At most this many covers and ratings are fetched at a time.
+    const MAX_FETCHES: usize = 6;
+
+    /// Take a fetch slot, or `false` when they're all busy. Nothing is recorded
+    /// in that case, so the next frame asks again.
+    fn start_fetch(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.inflight
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                (n < Self::MAX_FETCHES).then_some(n + 1)
+            })
+            .is_ok()
+    }
+
     /// The cover for `url` at this size, starting the fetch the first time it's
     /// asked for. `None` until it's decoded — the grid draws a placeholder.
     pub fn poster(&self, url: &str, w: u16, h: u16) -> Option<posters::Poster> {
         let key = (url.to_string(), w, h);
         {
-            let mut cache = self.posters.lock().unwrap();
+            let cache = self.posters.lock().unwrap();
             match cache.get(&key) {
                 Some(Load::Ready(p)) => return p.clone(),
                 Some(_) => return None, // already on its way, or given up on
-                None => cache.insert(key.clone(), Load::Loading),
-            };
+                None => {}
+            }
         }
-        let (slot, url) = (Arc::clone(&self.posters), url.to_string());
+        if !self.start_fetch() {
+            return None;
+        }
+        self.posters.lock().unwrap().insert(key.clone(), Load::Loading);
+        let (slot, busy, url) = (Arc::clone(&self.posters), Arc::clone(&self.inflight), url.to_string());
         thread::spawn(move || {
             let decoded = posters::load(&url, w, h);
             slot.lock().unwrap().insert(key, Load::Ready(decoded));
+            busy.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        None
+    }
+
+    /// Letterboxd's rating for a title on screen, fetched the first time it's
+    /// asked for. `None` until it lands — the tile just shows no number yet.
+    pub fn rating(&self, imdb_id: &str) -> Option<letterboxd::Rating> {
+        if !imdb_id.starts_with("tt") {
+            return None;
+        }
+        {
+            let cache = self.lb_ratings.lock().unwrap();
+            match cache.get(imdb_id) {
+                Some(Load::Ready(r)) => return r.clone(),
+                Some(_) => return None,
+                None => {}
+            }
+        }
+        if !self.start_fetch() {
+            return None;
+        }
+        self.lb_ratings.lock().unwrap().insert(imdb_id.to_string(), Load::Loading);
+        let (slot, busy, id) = (Arc::clone(&self.lb_ratings), Arc::clone(&self.inflight), imdb_id.to_string());
+        thread::spawn(move || {
+            let found = letterboxd::fetch(&id).ok().flatten();
+            slot.lock().unwrap().insert(id, Load::Ready(found));
+            busy.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         });
         None
     }

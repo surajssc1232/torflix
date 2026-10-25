@@ -3055,6 +3055,7 @@ dependencies = [
  "anyhow",
  "crossterm",
  "dirs",
+ "flate2",
  "image",
  "librqbit",
  "librqbit-dualstack-sockets",

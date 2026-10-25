@@ -199,9 +199,11 @@ fn draw_home_browse(f: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(YELLOW).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            if focused { "Enter: open   f: star   Tab: next list   ↑: search" } else { "↓: browse" },
+            if focused { "Enter: open   f: star   Tab: next list   ↑: search   " } else { "↓: browse   " },
             Style::default().fg(GRAY),
         ),
+        Span::styled("★ IMDb", Style::default().fg(YELLOW)),
+        Span::styled("  ◆ Letterboxd", Style::default().fg(GREEN)),
     ]);
     f.render_widget(Paragraph::new(title), Rect { height: 1, ..area });
 
@@ -224,7 +226,7 @@ fn draw_home_browse(f: &mut Frame, area: Rect, app: &App) {
 
 /// Cells across for one cover. Narrow enough that a modest terminal still
 /// fits several, wide enough that the picture reads.
-const COVER_W: u16 = 14;
+const COVER_W: u16 = 16;
 
 /// A grid of covers with their titles. Returns the number of columns used, so
 /// ↑/↓ can move a whole row at a time.
@@ -267,12 +269,19 @@ fn draw_cover_grid(
             Paragraph::new(Span::styled(clip(&item.name, COVER_W as usize), title_style)),
             Rect { x, y: y + cover_h, width: COVER_W, height: 1 },
         );
-        let mut sub = item.year_label();
+        // year · IMDb out of ten · Letterboxd out of five, each in its own colour.
+        let mut sub = vec![Span::styled(
+            clip(&item.year_label(), 5),
+            Style::default().fg(GRAY),
+        )];
         if let Some(r) = &item.imdb_rating {
-            sub = if sub.is_empty() { format!("★ {r}") } else { format!("{sub}  ★ {r}") };
+            sub.push(Span::styled(format!("  ★{r}"), Style::default().fg(YELLOW)));
+        }
+        if let Some(lb) = app.rating(&item.id) {
+            sub.push(Span::styled(format!("  ◆{:.1}", lb.score), Style::default().fg(GREEN)));
         }
         f.render_widget(
-            Paragraph::new(Span::styled(clip(&sub, COVER_W as usize), Style::default().fg(GRAY))),
+            Paragraph::new(Line::from(sub)),
             Rect { x, y: y + cover_h + 1, width: COVER_W, height: 1 },
         );
     }
@@ -716,15 +725,19 @@ fn draw_discover(f: &mut Frame, area: Rect, app: &App) {
     let inner = block.inner(area);
     f.render_widget(block, area);
     let starred = app.is_favorite(&items[app.catalog_selected.min(items.len() - 1)].id);
-    let hint = Line::from(Span::styled(
-        format!(
-            "  {} of {}   Enter: open   f: {}   b: next list   ←→↑↓: move",
-            app.catalog_selected + 1,
-            items.len(),
-            if starred { "unstar" } else { "star" }
+    let hint = Line::from(vec![
+        Span::styled(
+            format!(
+                "  {} of {}   Enter: open   f: {}   b: next list   ←→↑↓: move   ",
+                app.catalog_selected + 1,
+                items.len(),
+                if starred { "unstar" } else { "star" }
+            ),
+            Style::default().fg(GRAY),
         ),
-        Style::default().fg(GRAY),
-    ));
+        Span::styled("★ IMDb", Style::default().fg(YELLOW)),
+        Span::styled("  ◆ Letterboxd", Style::default().fg(GREEN)),
+    ]);
     f.render_widget(Paragraph::new(hint), Rect { height: 1, ..inner });
 
     let grid = Rect { y: inner.y + 1, height: inner.height.saturating_sub(1), ..inner };
