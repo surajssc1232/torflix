@@ -1,4 +1,4 @@
-use crate::app::{human_bytes, is_video, poster_url, progress_size, HomeFocus, App, Details, FileSortMode, InputPurpose, Load, Pane, PreviewState, SearchPreview, SearchStatus, SortMode, View};
+use crate::app::{human_bytes, is_video, poster_url, progress_size, HomeFocus, App, Placed, Details, FileSortMode, InputPurpose, Load, Pane, PreviewState, SearchPreview, SearchStatus, SortMode, View};
 use crate::history;
 use crate::posters;
 use crate::stremio::MetaItem;
@@ -21,6 +21,8 @@ const GRAY: Color = Color::Rgb(0x92, 0x83, 0x74);
 const ORANGE: Color = Color::Rgb(0xd6, 0x5d, 0x0e);
 
 pub fn draw(f: &mut Frame, app: &App) {
+    // Pictures are collected as the frame is laid out and written afterwards.
+    app.frame_images.borrow_mut().clear();
     let area = f.size();
     f.render_widget(Block::default().style(Style::default().bg(BG).fg(FG)), area);
 
@@ -287,11 +289,21 @@ fn draw_cover_grid(
 /// One cover, as half-block rows. Until it has been fetched and decoded — or
 /// when there is no picture to be had — a muted panel with the title stands in.
 fn draw_cover(f: &mut Frame, area: Rect, app: &App, item: &MetaItem, picked: bool) {
-    let cover = poster_url(item).and_then(|u| app.poster(&u, area.width, area.height));
-    match cover {
-        Some(p) => {
-            let lines: Vec<Line> = p
-                .rows
+    let url = poster_url(item);
+    let cover = url.as_ref().and_then(|u| app.poster(u, area.width, area.height));
+    match cover.as_deref().map(|p| &p.art) {
+        // A picture isn't drawn into the frame at all: the cells are left
+        // empty and the draw loop writes the pixels over them afterwards.
+        Some(posters::Art::Sixel(_)) => {
+            app.frame_images.borrow_mut().push(Placed {
+                col: area.x + 1,
+                row: area.y + 1,
+                key: crate::config::stable_hash(url.as_deref().unwrap_or_default()),
+                data: cover.clone().expect("just matched"),
+            });
+        }
+        Some(posters::Art::Blocks(rows)) => {
+            let lines: Vec<Line> = rows
                 .iter()
                 .map(|row| {
                     Line::from(
@@ -323,8 +335,11 @@ fn draw_cover(f: &mut Frame, area: Rect, app: &App, item: &MetaItem, picked: boo
             );
         }
     }
-    if picked {
-        // A bar down the left edge, so the pick is obvious even over a picture.
+    // A bar down the left edge, so the pick is obvious even over a cover. Not
+    // over a picture, though: writing a cell inside one would punch a hole in
+    // it, and the highlighted title says which cover is picked anyway.
+    let over_picture = matches!(cover.as_deref().map(|p| &p.art), Some(posters::Art::Sixel(_)));
+    if picked && !over_picture {
         let marks: Vec<Line> = (0..area.height)
             .map(|_| Line::from(Span::styled("▌", Style::default().fg(YELLOW))))
             .collect();

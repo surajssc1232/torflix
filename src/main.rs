@@ -10,7 +10,9 @@ mod posters;
 mod progress;
 mod rqbit;
 mod search;
+mod sixel;
 mod stremio;
+mod term;
 mod tv;
 mod ui;
 
@@ -23,7 +25,7 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use rqbit::Client;
-use std::io;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -115,6 +117,8 @@ fn main() -> Result<()> {
     }
 
     enable_raw_mode()?;
+    // Before anything else reads stdin: the terminal answers on it.
+    app.caps = term::probe();
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
@@ -162,6 +166,56 @@ fn main() -> Result<()> {
     res
 }
 
+/// Write the covers the frame left room for.
+///
+/// ratatui only sends the cells that changed, so a picture written over empty
+/// cells stays put between frames and only the ones that moved, arrived or
+/// went away are written again. The help overlay is the exception: it draws
+/// text across the grid, so the screen is repainted from scratch while it is
+/// up and the pictures come back when it closes.
+/// Answers whether the screen was thrown away and wants drawing again now.
+fn flush_images(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+) -> Result<bool> {
+    let wanted: Vec<app::Placed> = std::mem::take(&mut app.frame_images.borrow_mut());
+    if app.show_help {
+        if !app.shown_images.is_empty() {
+            terminal.clear()?;
+            app.shown_images.clear();
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+    // A picture that is no longer wanted, or has moved, leaves a hole the
+    // frame below it doesn't know to fill.
+    let stale = app
+        .shown_images
+        .iter()
+        .any(|was| !wanted.iter().any(|now| now == was));
+    if stale {
+        terminal.clear()?;
+        app.shown_images.clear();
+        return Ok(true);
+    }
+    let fresh: Vec<&app::Placed> = wanted
+        .iter()
+        .filter(|now| !app.shown_images.contains(now))
+        .collect();
+    if !fresh.is_empty() {
+        let out = terminal.backend_mut();
+        for img in fresh {
+            if let posters::Art::Sixel(data) = &img.data.art {
+                // Put the cursor on the cover's top-left cell and draw.
+                write!(out, "\x1b[{};{}H{}", img.row, img.col, data)?;
+            }
+        }
+        out.flush()?;
+    }
+    app.shown_images = wanted;
+    Ok(false)
+}
+
 fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
     loop {
         while let Ok(msg) = app.status_rx.try_recv() {
@@ -175,6 +229,12 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
 
         app.tick = app.tick.wrapping_add(1);
         terminal.draw(|f| ui::draw(f, app))?;
+        // A cover that moved takes the whole screen with it; draw it back
+        // straight away rather than leaving a gap until the next tick.
+        if flush_images(terminal, app)? {
+            terminal.draw(|f| ui::draw(f, app))?;
+            flush_images(terminal, app)?;
+        }
 
         if !event::poll(Duration::from_millis(250))? {
             continue;

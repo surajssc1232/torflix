@@ -1,9 +1,13 @@
 //! Movie covers in the terminal.
 //!
-//! Every character cell is drawn as `▀`: the foreground colour paints the top
-//! half of the cell, the background the bottom. One cell therefore carries two
-//! pixels stacked vertically, which is enough to recognise a poster and needs
-//! no terminal graphics protocol — it works anywhere 24-bit colour does.
+//! Where the terminal speaks sixel the cover is a real picture, rendered to
+//! the exact pixel size the cells cover — see [`crate::sixel`].
+//!
+//! Everywhere else each character cell is drawn as `▀`: the foreground colour
+//! paints the top half of the cell, the background the bottom. One cell
+//! therefore carries two pixels stacked vertically, which is enough to
+//! recognise a poster and needs no graphics protocol at all — it works
+//! anywhere 24-bit colour does, at a fraction of the detail.
 //!
 //! Covers are fetched once and kept as JPEG bytes in the cache directory, so a
 //! second look at the same title costs nothing.
@@ -12,12 +16,21 @@ use std::path::PathBuf;
 
 pub type Rgb = (u8, u8, u8);
 
-/// A decoded cover: `rows[y][x]` is the (top, bottom) colour of one cell.
+/// A cover ready to put on screen, however this terminal can manage it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Art {
+    /// `rows[y][x]` is the (top, bottom) colour of one cell.
+    Blocks(Vec<Vec<(Rgb, Rgb)>>),
+    /// An escape sequence to write at the cover's top-left cell.
+    Sixel(String),
+}
+
+/// A decoded cover and the size in cells it was made for.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Poster {
     pub width: u16,
     pub height: u16,
-    pub rows: Vec<Vec<(Rgb, Rgb)>>,
+    pub art: Art,
 }
 
 /// Cells tall for a cover `width` cells wide, keeping a poster's 2:3 shape.
@@ -56,10 +69,31 @@ fn bytes(url: &str) -> Option<Vec<u8>> {
     Some(body)
 }
 
-/// Fetch and decode a cover to a `width` × `height` grid of cells. Blocking —
+/// Fetch and decode a cover to a `width` × `height` grid of cells. `cell` is
+/// the pixel size of one cell when the terminal can draw pictures. Blocking —
 /// call it off the draw thread.
-pub fn load(url: &str, width: u16, height: u16) -> Option<Poster> {
-    decode(&bytes(url)?, width, height)
+pub fn load(url: &str, width: u16, height: u16, cell: Option<(u16, u16)>) -> Option<Poster> {
+    let raw = bytes(url)?;
+    match cell {
+        Some(cell) => decode_sixel(&raw, width, height, cell),
+        None => decode(&raw, width, height),
+    }
+}
+
+/// The cover as a picture filling exactly the cells it is given.
+fn decode_sixel(raw: &[u8], width: u16, height: u16, (cw, ch): (u16, u16)) -> Option<Poster> {
+    if width == 0 || height == 0 || cw == 0 || ch == 0 {
+        return None;
+    }
+    let img = image::load_from_memory(raw).ok()?;
+    let px = img
+        .resize_exact(
+            width as u32 * cw as u32,
+            height as u32 * ch as u32,
+            image::imageops::FilterType::Lanczos3,
+        )
+        .to_rgb8();
+    Some(Poster { width, height, art: Art::Sixel(crate::sixel::encode(&px)) })
 }
 
 fn decode(raw: &[u8], width: u16, height: u16) -> Option<Poster> {
@@ -82,7 +116,7 @@ fn decode(raw: &[u8], width: u16, height: u16) -> Option<Poster> {
                 .collect()
         })
         .collect();
-    Some(Poster { width, height, rows })
+    Some(Poster { width, height, art: Art::Blocks(rows) })
 }
 
 #[cfg(test)]
@@ -106,11 +140,12 @@ mod tests {
     fn each_cell_carries_two_stacked_pixels() {
         let p = decode(&sample(), 2, 2).expect("decoded");
         assert_eq!((p.width, p.height), (2, 2));
-        assert_eq!(p.rows.len(), 2);
-        assert_eq!(p.rows[0].len(), 2);
+        let Art::Blocks(rows) = &p.art else { panic!("not blocks") };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].len(), 2);
         // Top row of cells is the red half, bottom row the blue one.
-        assert_eq!(p.rows[0][0], ((255, 0, 0), (255, 0, 0)));
-        assert_eq!(p.rows[1][1], ((0, 0, 255), (0, 0, 255)));
+        assert_eq!(rows[0][0], ((255, 0, 0), (255, 0, 0)));
+        assert_eq!(rows[1][1], ((0, 0, 255), (0, 0, 255)));
     }
 
     #[test]
@@ -122,6 +157,16 @@ mod tests {
     #[test]
     fn rubbish_bytes_are_not_a_cover() {
         assert!(decode(b"definitely not an image", 4, 4).is_none());
+        assert!(decode_sixel(b"definitely not an image", 4, 4, (10, 20)).is_none());
+    }
+
+    #[test]
+    fn a_picture_is_rendered_to_the_pixels_the_cells_cover() {
+        let p = decode_sixel(&sample(), 2, 3, (10, 20)).expect("decoded");
+        assert_eq!((p.width, p.height), (2, 3));
+        let Art::Sixel(data) = &p.art else { panic!("not a picture") };
+        // 2 cells × 10px wide, 3 cells × 20px tall.
+        assert!(data.contains("\"1;1;20;60"), "{}", &data[..40]);
     }
 
     #[test]

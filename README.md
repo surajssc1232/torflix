@@ -218,6 +218,7 @@ set -gx TORFLIX_PROWLARR_APIKEY "your_api_key_here"
 | `TORFLIX_PROWLARR_APIKEY` | — | Prowlarr API key |
 | `TORFLIX_JACKETT_URL` | — | Jackett base URL |
 | `TORFLIX_JACKETT_APIKEY` | — | Jackett API key |
+| `TORFLIX_SIXEL` | auto | `0` forces half-block covers, `1` forces sixel pictures |
 | `TORFLIX_OMDB_KEY` | — | [OMDb API key](https://www.omdbapi.com/apikey.aspx) for IMDb + RT ratings |
 | `TORFLIX_PLAYER` | auto | Player override (e.g. `mpv --fullscreen`) |
 | `TORFLIX_DOWNLOAD_DIR` | `~/Downloads/torflix` | Permanent download directory (also settable per-session with `-d <path>`, or in `/settings`) |
@@ -250,7 +251,11 @@ When streaming from a multi-file torrent (a season pack, say), torflix fetches o
 
 Press `Ctrl+P` on the home screen to search the **catalog** instead of torrent indexers. It uses [Stremio addons](https://github.com/Stremio/stremio-addon-sdk): titles, posters and ratings come from Cinemeta, and a series opens with its seasons and episodes.
 
-Covers are drawn with half-block characters — one character cell carries two pixels, its foreground colour painting the top and its background the bottom — so they need no terminal graphics protocol and work anywhere 24-bit colour does. They're cached under `~/.cache/torflix/posters`.
+Covers are **real pictures** where the terminal can draw them. At startup torflix asks the terminal what it supports; if the reply says sixel — foot, xterm, WezTerm, Konsole, contour, mlterm and others — each cover is rendered to the exact pixel size its cells cover and written as a sixel image. The palette is picked out of the picture itself by median cut rather than from a fixed colour cube, which is what keeps skin tones and dark scenes from banding.
+
+Terminals that can't do sixel fall back to half-block characters: one character cell carries two pixels, its foreground colour painting the top and its background the bottom. That needs no graphics protocol and works anywhere 24-bit colour does, at a fraction of the detail — a 16-cell cover is 16×24 pixels as blocks against roughly 192×312 as a picture.
+
+Set `TORFLIX_SIXEL=0` to force the half-blocks, or `=1` to insist on pictures if the probe gets it wrong. Inside tmux or screen the fallback is always used. Covers are cached under `~/.cache/torflix/posters`.
 
 Each cover carries its ◆ **Letterboxd** rating out of five, in green, and so does a title's details. Letterboxd has no public API, so torflix does what [digital-drop-movies](https://digital-drop-movies.netlify.app/) does: `letterboxd.com/imdb/<id>/` redirects to the film's page, which embeds its `ratingValue` and `ratingCount` as JSON-LD. The page is ~310 KB, but gzipped it's about 43 KB — the size of a poster — so it is asked for compressed, fetched only for covers actually on screen (at most six covers and ratings at a time), and cached for a week under `~/.cache/torflix/letterboxd`.
 

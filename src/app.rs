@@ -111,6 +111,19 @@ pub struct PendingDownload {
     pub file_idx: Option<usize>,
 }
 
+/// A picture placed on the screen: where it goes, and which cover it is.
+///
+/// The screen cell is 1-based, as the escape code that moves the cursor wants
+/// it. `key` identifies the cover itself, so a frame that only moved the
+/// selection doesn't cost a redraw of every picture.
+#[derive(Clone, PartialEq)]
+pub struct Placed {
+    pub col: u16,
+    pub row: u16,
+    pub key: u64,
+    pub data: Arc<posters::Poster>,
+}
+
 /// A catalog download waiting for the open title's streams to arrive.
 #[derive(Clone)]
 pub struct AwaitingStreams {
@@ -334,7 +347,14 @@ pub struct App {
     pub home_list: usize,
     pub home_selected: usize,
     /// Covers, keyed by url and the cell size they were decoded for.
-    pub posters: Arc<Mutex<HashMap<(String, u16, u16), Load<Option<posters::Poster>>>>>,
+    pub posters: Arc<Mutex<HashMap<(String, u16, u16), Load<Option<Arc<posters::Poster>>>>>>,
+    /// What the terminal can draw, settled once at startup.
+    pub caps: crate::term::Caps,
+    /// Pictures the frame being drawn wants written over it, in the order the
+    /// grid laid them out. Filled by the ui, drained by the draw loop.
+    pub frame_images: std::cell::RefCell<Vec<Placed>>,
+    /// The pictures currently on screen, so only what moved is redrawn.
+    pub shown_images: Vec<Placed>,
     /// Letterboxd ratings for titles on screen, keyed by IMDb id.
     pub lb_ratings: Arc<Mutex<HashMap<String, Load<Option<letterboxd::Rating>>>>>,
     /// Covers and ratings being fetched right now, so a screenful of tiles
@@ -423,6 +443,9 @@ impl App {
             home_list: 0,
             home_selected: 0,
             posters: Arc::new(Mutex::new(HashMap::new())),
+            caps: crate::term::Caps::default(),
+            frame_images: std::cell::RefCell::new(Vec::new()),
+            shown_images: Vec::new(),
             lb_ratings: Arc::new(Mutex::new(HashMap::new())),
             inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             grid_cols: std::cell::Cell::new(1),
@@ -1455,7 +1478,7 @@ impl App {
 
     /// The cover for `url` at this size, starting the fetch the first time it's
     /// asked for. `None` until it's decoded — the grid draws a placeholder.
-    pub fn poster(&self, url: &str, w: u16, h: u16) -> Option<posters::Poster> {
+    pub fn poster(&self, url: &str, w: u16, h: u16) -> Option<Arc<posters::Poster>> {
         let key = (url.to_string(), w, h);
         {
             let cache = self.posters.lock().unwrap();
@@ -1470,8 +1493,9 @@ impl App {
         }
         self.posters.lock().unwrap().insert(key.clone(), Load::Loading);
         let (slot, busy, url) = (Arc::clone(&self.posters), Arc::clone(&self.inflight), url.to_string());
+        let cell = self.caps.sixel.then_some(self.caps.cell).flatten();
         thread::spawn(move || {
-            let decoded = posters::load(&url, w, h);
+            let decoded = posters::load(&url, w, h, cell).map(Arc::new);
             slot.lock().unwrap().insert(key, Load::Ready(decoded));
             busy.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         });

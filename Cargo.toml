@@ -1,6 +1,6 @@
 [package]
 name = "torflix"
-version = "0.6.5"
+version = "0.6.6"
 edition = "2021"
 description = "Stream movies in your terminal from magnet links and torrents — powered by rqbit + mpv/vlc"
 license = "MIT"
@@ -21,6 +21,7 @@ anyhow = "1"
 dirs = "5"
 flate2 = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+libc = "0.2"
 librqbit = { version = "9.0.0-rc.0", features = ["http-api", "tracing-subscriber-utils"] }
 librqbit-dualstack-sockets = "0.7"
 openssl = { version = "0.10", features = ["vendored"] }
