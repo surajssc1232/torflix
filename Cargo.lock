@@ -3067,7 +3067,7 @@ dependencies = [
 
 [[package]]
 name = "torflix"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "crossterm",
