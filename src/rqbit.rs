@@ -12,6 +12,14 @@ pub struct Client {
     base: String,
 }
 
+impl Client {
+    /// The API this client talks to, for anyone who needs to start an engine
+    /// there.
+    pub fn base_url(&self) -> &str {
+        &self.base
+    }
+}
+
 // ---------- API response types ----------
 
 #[derive(Debug, Deserialize)]

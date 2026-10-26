@@ -11,6 +11,7 @@ use crate::tv;
 use crate::rqbit::{Client, FileDetails, TorrentStats};
 use crate::search::{self, SearchResult};
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -243,7 +244,13 @@ impl SubtitleQuery {
 }
 
 /// How long playback may wait for subtitles once the video itself is ready.
+/// How long VLC playback waits for subtitles, which it can only take at
+/// startup. mpv doesn't wait at all — see [`attach_subtitles_later`].
 const SUBTITLE_WAIT: Duration = Duration::from_secs(4);
+/// How long the background lookup is given before it's given up on.
+const SUBTITLE_LOOKUP_LIMIT: Duration = Duration::from_secs(30);
+/// How long to wait for mpv to open its IPC socket after starting.
+const PLAYER_IPC_WAIT: Duration = Duration::from_secs(10);
 
 /// Subtitles handed to mpv: the best first, the rest a keypress (j) away if it's off.
 const MAX_SUBTITLES: usize = 4;
@@ -330,6 +337,13 @@ pub struct App {
     pub stream_ids: Arc<Mutex<HashSet<u64>>>,
     /// True when this process owns the engine, so quitting would stop downloads.
     pub embedded: bool,
+    /// The engine running inside this process, when there is one. Taken at
+    /// shutdown so it can be stopped before the daemon takes over.
+    pub engine: Option<crate::rqbit::EmbeddedEngine>,
+    /// When the engine was last started here, so a failing port isn't hammered.
+    last_engine_try: Option<std::time::Instant>,
+    /// An engine being started in the background.
+    starting_engine: Option<Receiver<std::result::Result<crate::rqbit::EmbeddedEngine, String>>>,
     /// Set by the quit prompt: hand unfinished downloads to a background engine.
     pub keep_downloading: bool,
     /// View to go back to if the quit prompt is cancelled.
@@ -438,6 +452,9 @@ impl App {
             history_selected: 0,
             stream_ids: Arc::new(Mutex::new(HashSet::new())),
             embedded: true,
+            engine: None,
+            last_engine_try: None,
+            starting_engine: None,
             keep_downloading: false,
             quit_return_view: View::Home,
             config: crate::config::load(),
@@ -720,13 +737,21 @@ impl App {
             let url = client.stream_url(id, idx);
             let title = file.name.clone();
             let mut opts = PlayOpts::resuming(progress::torrent_key(&target, idx));
-            if let Some(pending) = &subtitles {
+            // mpv is started straight away and told about subtitles later over
+            // its IPC socket; anything else has to have them up front.
+            let late_subs = takes_subtitles_later(&player_cmd);
+            if late_subs {
+                opts.ipc = Some(temp_dir.join("mpv.sock"));
+            } else if let Some(pending) = &subtitles {
                 let _ = tx.send("⧗ looking for subtitles…".into());
                 opts.subtitles = pending.recv_timeout(SUBTITLE_WAIT).unwrap_or_default();
             }
 
             match spawn_player(&player_cmd, &url, &title, &opts) {
                 Ok(mut child) => {
+                    if let (true, Some(pending), Some(sock)) = (late_subs, subtitles, opts.ipc.clone()) {
+                        attach_subtitles_later(sock, pending, tx.clone());
+                    }
                     let _ = tx.send(format!(
                         "▶ streaming: {}{}{}  [tmp: {}]",
                         title,
@@ -1561,6 +1586,8 @@ impl App {
 
     /// At most this many covers and ratings are fetched at a time.
     const MAX_FETCHES: usize = 6;
+    /// How long to leave the port alone between attempts to start an engine.
+    const ENGINE_RETRY: Duration = Duration::from_secs(5);
 
     /// Take a fetch slot, or `false` when they're all busy. Nothing is recorded
     /// in that case, so the next frame asks again.
@@ -1956,11 +1983,31 @@ impl App {
         thread::spawn(move || {
             let mut opts = PlayOpts::resuming(progress::url_key(&url));
             opts.headers = headers;
-            opts.subtitles = pending.recv_timeout(SUBTITLE_WAIT).unwrap_or_default();
+            // As above: mpv starts now and hears about subtitles when they come.
+            let late_subs = takes_subtitles_later(&player_cmd);
+            // One socket per playback, so two at once don't talk over each other.
+            let sock = std::env::temp_dir().join(format!(
+                "torflix-mpv-{}-{}.sock",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0)
+            ));
+            if late_subs {
+                std::fs::remove_file(&sock).ok();
+                opts.ipc = Some(sock.clone());
+            } else {
+                opts.subtitles = pending.recv_timeout(SUBTITLE_WAIT).unwrap_or_default();
+            }
             match spawn_player(&player_cmd, &url, &label, &opts) {
                 Ok(mut child) => {
+                    if late_subs {
+                        attach_subtitles_later(sock.clone(), pending, tx.clone());
+                    }
                     let _ = tx.send(format!("▶ playing: {label}{}{}", opts.resume_note(), subtitle_note(&opts)));
                     child.wait().ok();
+                    std::fs::remove_file(&sock).ok();
                     let _ = tx.send(format!("✓ done: {label}"));
                 }
                 Err(e) => {
@@ -2140,7 +2187,54 @@ impl App {
     }
 
     /// Apply results of background work that change app state, not just the status line.
+    /// Keep an engine to talk to.
+    ///
+    /// torflix uses an engine that's already listening when it finds one —
+    /// usually its own background daemon. That daemon stops once it has
+    /// nothing left to download, which used to leave the screen reading
+    /// OFFLINE with no way back but restarting. So when the engine goes away
+    /// and this process hasn't got one of its own, it starts one.
+    fn recover_engine(&mut self) {
+        // An engine started here takes a while to come up, so it's started on
+        // its own thread and collected once it's ready.
+        if let Some(rx) = &self.starting_engine {
+            match rx.try_recv() {
+                Ok(Ok(engine)) => {
+                    self.engine = Some(engine);
+                    self.embedded = true;
+                    self.starting_engine = None;
+                    self.status = "engine went away — started one here, downloads resumed".into();
+                }
+                Ok(Err(e)) => {
+                    self.starting_engine = None;
+                    self.status = format!("✗ couldn't start an engine: {e}");
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.starting_engine = None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+            return;
+        }
+        if self.engine.is_some() || *self.engine_up.lock().unwrap() {
+            return;
+        }
+        // The daemon may be mid-handoff and the port free only for a moment;
+        // don't spin on it.
+        if self.last_engine_try.is_some_and(|t| t.elapsed() < Self::ENGINE_RETRY) {
+            return;
+        }
+        self.last_engine_try = Some(std::time::Instant::now());
+        let (tx, rx) = channel();
+        let api = self.client.base_url().to_string();
+        self.starting_engine = Some(rx);
+        thread::spawn(move || {
+            let started = crate::rqbit::start_embedded_engine(&download_dir(), &api)
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(started);
+        });
+    }
+
     pub fn poll_background(&mut self) {
+        self.recover_engine();
         self.poll_awaiting_streams();
         let installed = self.installed_addon.lock().unwrap().take();
         if let Some(addon) = installed {
@@ -2563,6 +2657,9 @@ pub struct PlayOpts {
     pub headers: Vec<(String, String)>,
     /// Progress key: mpv records the position under it.
     pub track_key: Option<String>,
+    /// Where mpv should listen for commands, so subtitles found after it
+    /// started can still be handed to it.
+    pub ipc: Option<std::path::PathBuf>,
 }
 
 impl PlayOpts {
@@ -2699,6 +2796,77 @@ fn local_subtitle(url: &str) -> Option<String> {
 }
 
 /// Spawns the media player with title, resume, subtitle and header flags.
+
+/// Whether this player can be given subtitles after it has started. Only mpv
+/// has the IPC socket for it.
+fn takes_subtitles_later(player_cmd: &str) -> bool {
+    cfg!(unix)
+        && player_cmd
+            .split_whitespace()
+            .next()
+            .map(|bin| bin.to_lowercase().contains("mpv"))
+            .unwrap_or(false)
+}
+
+/// Hand subtitles to a player that has already started.
+///
+/// mpv takes `--sub-file` only on its command line, so waiting for the
+/// subtitle lookup used to hold the video back by up to four seconds. Instead
+/// mpv is started at once with an IPC socket, and whatever the lookup turns up
+/// is added over that socket, whenever it turns up.
+fn attach_subtitles_later(
+    sock: std::path::PathBuf,
+    pending: std::sync::mpsc::Receiver<Vec<String>>,
+    tx: std::sync::mpsc::Sender<String>,
+) {
+    thread::spawn(move || {
+        let Ok(found) = pending.recv_timeout(SUBTITLE_LOOKUP_LIMIT) else {
+            return;
+        };
+        let files: Vec<String> = found.iter().filter_map(|s| local_subtitle(s)).collect();
+        if files.is_empty() {
+            return;
+        }
+        // mpv creates the socket a moment after it starts.
+        let Some(mut pipe) = connect_to_player(&sock) else {
+            let _ = tx.send("⚠ subtitles found, but mpv didn't answer — press j to cycle".into());
+            return;
+        };
+        for (i, file) in files.iter().enumerate() {
+            // The first one is selected; the rest are there to switch to.
+            let how = if i == 0 { "select" } else { "auto" };
+            let cmd = serde_json::json!({ "command": ["sub-add", file, how] });
+            if writeln!(pipe, "{cmd}").is_err() {
+                return;
+            }
+        }
+        let _ = pipe.flush();
+        let _ = tx.send(format!(
+            "subtitles added: {} track{}",
+            files.len(),
+            if files.len() == 1 { "" } else { "s" }
+        ));
+    });
+}
+
+/// Wait for mpv to create its IPC socket, then open it.
+#[cfg(unix)]
+fn connect_to_player(sock: &std::path::Path) -> Option<std::os::unix::net::UnixStream> {
+    let deadline = std::time::Instant::now() + PLAYER_IPC_WAIT;
+    while std::time::Instant::now() < deadline {
+        if let Ok(stream) = std::os::unix::net::UnixStream::connect(sock) {
+            return Some(stream);
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    None
+}
+
+#[cfg(not(unix))]
+fn connect_to_player(_sock: &std::path::Path) -> Option<std::fs::File> {
+    None
+}
+
 fn spawn_player(player_cmd: &str, url: &str, title: &str, opts: &PlayOpts) -> std::io::Result<std::process::Child> {
     // Only rqbit streams benefit from pre-fetching; other hosts may need headers.
     if url.contains("/torrents/") && url.contains("/stream/") {
@@ -2713,6 +2881,13 @@ fn spawn_player(player_cmd: &str, url: &str, title: &str, opts: &PlayOpts) -> st
     cmd.args(&extra);
     let bin_lc = bin.to_lowercase();
     if bin_lc.contains("mpv") {
+        // mpv checks whether a URL needs youtube-dl before opening it, which
+        // costs about a third of a second. Our stream is a plain file over
+        // 127.0.0.1, so there is nothing for it to find.
+        cmd.arg("--no-ytdl");
+        if let Some(sock) = &opts.ipc {
+            cmd.arg(format!("--input-ipc-server={}", sock.display()));
+        }
         cmd.arg(format!("--force-media-title={}", title));
         if let Some(start) = opts.start {
             cmd.arg(format!("--start={start}"));
@@ -3022,6 +3197,17 @@ mod tests {
             assert!(app.details.is_none());
             assert!(app.view == opened_from, "came back to the wrong screen");
         }
+    }
+
+    #[test]
+    fn only_mpv_can_be_told_about_subtitles_afterwards() {
+        assert!(takes_subtitles_later("mpv"));
+        assert!(takes_subtitles_later("/usr/bin/mpv --fullscreen"));
+        assert!(takes_subtitles_later("MPV"));
+        // VLC has no such socket, so it has to be given them at startup.
+        assert!(!takes_subtitles_later("vlc"));
+        assert!(!takes_subtitles_later("/usr/bin/vlc --no-one-instance"));
+        assert!(!takes_subtitles_later(""));
     }
 
     #[test]

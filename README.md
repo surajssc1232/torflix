@@ -305,12 +305,22 @@ Type these in the home search box:
 
 Settings live in `~/.config/torflix/` (`config.json`, `addons.json`, `tv.json`); favorites, history and resume positions in `~/.local/share/torflix/`. Environment variables such as `TORFLIX_PLAYER` still take precedence.
 
+### Why playback starts when it does
+
+Pressing Enter on a stream does this: add the magnet to the engine, wait for its metadata (the file list) to come back from peers, pick the biggest video file, then start the player pointed at a local HTTP URL the engine serves. The engine fetches the pieces the player asks for, so playing starts long before the download finishes.
+
+Almost all of the wait is **metadata resolution** — a magnet link carries no file list, so the swarm has to be found first. That is 1–10 seconds on a healthy torrent and can be much worse on a thin one; torflix gives up after 60. Everything else is small: the engine accepts the magnet in about 0.1s, the first megabyte usually arrives in under 2, and mpv shows a frame 0.3s after it starts. Seeking is cheap — a request for the end of a 545 MiB torrent was served in 0.1s, pulling 1 MiB, so skipping ahead doesn't mean downloading everything in between.
+
+Two things torflix does to keep its own overhead out of the way: mpv is started with `--no-ytdl`, since it would otherwise spend a third of a second working out whether a local URL needs youtube-dl, and subtitles are no longer waited for — mpv starts at once with an IPC socket and the subtitle tracks are added over it whenever the lookup finishes. (VLC can only take subtitles at startup, so it still waits up to 4 seconds for them.)
+
 ## Background downloads
 
 Downloads survive quitting. Press `q` with downloads still running and torflix asks:
 
 - **`y`** — keep downloading in the background. A headless engine takes over, and stops itself once everything has finished.
 - **`n`** — quit now. Unfinished downloads pause and resume where they left off the next time you open torflix.
+
+If the engine torflix attached to goes away — the daemon finishing, or being killed — torflix notices and starts one of its own rather than sitting there saying OFFLINE.
 
 **Closing the terminal counts as `y`.** A terminal window closing sends SIGHUP, and a logout or `kill` sends SIGTERM; torflix catches both, hands whatever is still downloading to the background engine and exits cleanly, rather than taking the engine down with it. Nothing is lost if you simply close the window on it.
 

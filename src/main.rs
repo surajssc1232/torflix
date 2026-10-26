@@ -105,6 +105,9 @@ fn main() -> Result<()> {
 
     let mut app = App::new(client);
     app.embedded = embedded_engine.is_some();
+    // The app owns the engine from here: it may start a replacement if the one
+    // we attached to goes away.
+    app.engine = embedded_engine;
     if !app.embedded && daemon::is_running() {
         app.status = "connected to background engine — downloads kept going while torflix was closed".into();
     }
@@ -145,7 +148,7 @@ fn main() -> Result<()> {
     let _ = terminal.show_cursor();
 
     let active = app.active_download_count();
-    if let Some(mut e) = embedded_engine {
+    if let Some(mut e) = app.engine.take() {
         // Stopping first frees the API port for the daemon and flushes resume state.
         e.stop();
         if app.keep_downloading {
