@@ -1,5 +1,6 @@
 use crate::app::{human_bytes, is_video, poster_url, progress_size, HomeFocus, App, Placed, Details, FileSortMode, InputPurpose, Load, Pane, PreviewState, SearchPreview, SearchStatus, SortMode, View};
 use crate::history;
+use crate::picker;
 use crate::posters;
 use crate::stremio::MetaItem;
 use ratatui::{
@@ -53,7 +54,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     // Popups float over whatever screen opened them.
     let base = match app.view {
         View::ConfirmQuit => &app.quit_return_view,
-        View::AddInput => &app.input_return,
+        View::AddInput | View::PickFolder => &app.input_return,
         _ => &app.view,
     };
     match base {
@@ -74,6 +75,9 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     if app.view == View::AddInput {
         draw_add_popup(f, area, app);
+    }
+    if app.view == View::PickFolder {
+        draw_picker_popup(f, area, app);
     }
     if app.view == View::ConfirmDelete {
         draw_confirm_popup(f, area, app);
@@ -532,11 +536,12 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
         View::SearchResults if app.search_filter_active
                             => " type: filter   Backspace: delete   Ctrl+U: clear   Esc: clear+close   Enter: keep+close",
         View::SearchResults => " /: filter   f: files   Enter: stream   d: download   D: download to…   o: sort   s: new search   Esc: back",
-        View::ConfirmDelete => " y: confirm   n/Esc: cancel",
+        View::ConfirmDelete => " ↑↓: choose   Enter: confirm   y: keep files   d: delete files   Esc: cancel",
         View::Torrents      => " s/Esc: search   Tab: history   a: add   Enter: files   Space: pause   d: remove   q: quit",
         View::History       => " Enter: stream again   d: download   D: download to…   x: remove   j/k: move   Tab/Esc: home   q: quit",
         View::ConfirmQuit   => " y: keep downloading in background   n: quit and pause   Esc: cancel",
         View::AddInput      => " Enter: add   Esc: cancel",
+        View::PickFolder    => " ↑↓: move   Enter/→: open folder   ←: up   u: use this folder   t: type a path   Esc: cancel",
     };
     f.render_widget(
         Paragraph::new(Span::styled(help, Style::default().fg(GRAY).bg(Color::Rgb(0x1d, 0x20, 0x21)))),
@@ -1119,6 +1124,60 @@ fn centered_rect(width: u16, height: u16, r: Rect) -> Rect {
     Rect { x, y, width: width.min(r.width), height: height.min(r.height) }
 }
 
+/// The folder picker: the folders inside one folder, with the folder itself
+/// as the first row, so choosing where a download goes is all arrow keys.
+fn draw_picker_popup(f: &mut Frame, area: Rect, app: &App) {
+    let Some(picker) = app.picker.as_ref() else { return };
+    let w = area.width.saturating_sub(8).min(80).max(30);
+    let h = area.height.saturating_sub(4).min(22).max(8);
+    let popup = centered_rect(w, h, area);
+    f.render_widget(Clear, popup);
+
+    let rows = popup.height.saturating_sub(2) as usize;
+    // Keep the highlight in view without moving it about more than needed.
+    let first = picker.selected.saturating_sub(rows.saturating_sub(1));
+    let lines: Vec<Line> = picker
+        .rows
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(rows)
+        .map(|(i, row)| {
+            let picked = i == picker.selected;
+            let (mark, style) = match row {
+                picker::Row::Use => (
+                    "▸ ",
+                    Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+                ),
+                picker::Row::Up => ("  ", Style::default().fg(GRAY)),
+                picker::Row::Recent(_) => ("  ", Style::default().fg(YELLOW)),
+                picker::Row::Dir(_) => ("  ", Style::default().fg(FG)),
+            };
+            let style = if picked { style.bg(Color::Rgb(0x3c, 0x38, 0x36)).add_modifier(Modifier::BOLD) } else { style };
+            let name = picker.label(row);
+            let name = match row {
+                picker::Row::Dir(_) => format!("{name}/"),
+                _ => name,
+            };
+            Line::from(Span::styled(
+                format!("{mark}{:<width$}", clip(&name, w as usize - 4), width = w as usize - 4),
+                style,
+            ))
+        })
+        .collect();
+
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" {} ", clip(&crate::config::tilde(&picker.dir), w as usize - 4)))
+                .title_style(Style::default().fg(YELLOW).add_modifier(Modifier::BOLD))
+                .border_style(Style::default().fg(GRAY)),
+        ),
+        popup,
+    );
+}
+
 fn draw_add_popup(f: &mut Frame, area: Rect, app: &App) {
     let w = area.width.saturating_sub(8).min(90).max(30);
     let popup = centered_rect(w, 5, area);
@@ -1157,27 +1216,49 @@ fn draw_add_popup(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_confirm_popup(f: &mut Frame, area: Rect, app: &App) {
-    let popup = centered_rect(56, 5, area);
+    let popup = centered_rect(60, 9, area);
     f.render_widget(Clear, popup);
     let name = app.selected_row().map(|r| r.name).unwrap_or_default();
-    let (title, warn) = if app.delete_with_files {
-        (" remove torrent AND delete files? ", RED)
-    } else {
-        (" remove torrent (keep files)? ", YELLOW)
-    };
-    let p = Paragraph::new(vec![
+
+    let width = popup.width as usize - 4;
+    let mut lines = vec![
+        Line::from(Span::styled(
+            clip(&name, width),
+            Style::default().fg(FG).add_modifier(Modifier::BOLD),
+        )),
         Line::from(""),
-        Line::from(Span::styled(name, Style::default().fg(FG).add_modifier(Modifier::BOLD))),
-    ])
-    .alignment(Alignment::Center)
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(title)
-            .border_style(Style::default().fg(warn))
-            .style(Style::default().bg(BG)),
+    ];
+    for (i, answer) in App::DELETE_CHOICES.iter().enumerate() {
+        let picked = i == app.delete_choice;
+        // Deleting the files is the one that can't be undone, so it is the
+        // one that reads as a warning.
+        let colour = match i {
+            1 => RED,
+            2 => GRAY,
+            _ => YELLOW,
+        };
+        let style = if picked {
+            Style::default().fg(BG).bg(colour).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(colour)
+        };
+        lines.push(Line::from(Span::styled(
+            format!(" {} {answer:<width$}", if picked { "▸" } else { " " }, width = width - 3),
+            style,
+        )));
+    }
+
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" remove this download? ")
+                .title_style(Style::default().fg(YELLOW).add_modifier(Modifier::BOLD))
+                .border_style(Style::default().fg(if app.delete_choice == 1 { RED } else { YELLOW }))
+                .style(Style::default().bg(BG)),
+        ),
+        popup,
     );
-    f.render_widget(p, popup);
 }
 
 fn render_results_table(

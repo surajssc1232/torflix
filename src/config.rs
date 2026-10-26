@@ -44,6 +44,9 @@ pub struct Config {
     pub subtitle_lang: String,
     /// What the home search box searches.
     pub search_source: SearchSource,
+    /// Folders recently downloaded into, most recent first, for the picker.
+    #[serde(default)]
+    pub recent_dests: Vec<String>,
 }
 
 impl Default for Config {
@@ -53,6 +56,7 @@ impl Default for Config {
             download_dir: None,
             subtitle_lang: "eng".into(),
             search_source: SearchSource::Torrents,
+            recent_dests: Vec::new(),
         }
     }
 }
@@ -84,6 +88,15 @@ pub fn subtitle_lang_label(code: &str) -> &'static str {
         .find(|(c, _)| c.eq_ignore_ascii_case(code))
         .map(|(_, label)| *label)
         .unwrap_or("custom")
+}
+
+/// The other way round: shorten a path under the home folder for display.
+pub fn tilde(p: &std::path::Path) -> String {
+    match dirs::home_dir().and_then(|h| p.strip_prefix(h).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".into(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => p.display().to_string(),
+    }
 }
 
 /// Expand a leading `~` so a hand-typed path like `~/Movies` works.

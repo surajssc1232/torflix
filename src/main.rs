@@ -6,6 +6,7 @@ mod favorites;
 mod history;
 mod letterboxd;
 mod omdb;
+mod picker;
 mod posters;
 mod progress;
 mod rqbit;
@@ -176,16 +177,16 @@ fn main() -> Result<()> {
 ///
 /// ratatui only sends the cells that changed, so a picture written over empty
 /// cells stays put between frames and only the ones that moved, arrived or
-/// went away are written again. The help overlay is the exception: it draws
-/// text across the grid, so the screen is repainted from scratch while it is
-/// up and the pictures come back when it closes.
+/// went away are written again. Popups are the exception: they draw text
+/// across the grid, so the screen is repainted from scratch while one is up
+/// and the pictures come back when it closes.
 /// Answers whether the screen was thrown away and wants drawing again now.
 fn flush_images(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
 ) -> Result<bool> {
     let wanted: Vec<app::Placed> = std::mem::take(&mut app.frame_images.borrow_mut());
-    if app.show_help {
+    if app.overlay_up() {
         if !app.shown_images.is_empty() {
             terminal.clear()?;
             app.shown_images.clear();
@@ -314,8 +315,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                         KeyCode::Enter => app.open_home_selected(),
                         KeyCode::Tab => app.home_next_list(),
                         KeyCode::Char('f') => app.toggle_favorite(),
+                        KeyCode::Char('d') => app.download_catalog_selected(false),
+                        KeyCode::Char('D') => app.download_catalog_selected(true),
                         KeyCode::Esc => app.home_focus = HomeFocus::Search,
-                        // Anything typed belongs in the search box, so go back to it.
+                        // Anything else typed belongs in the search box, so go back to it.
                         KeyCode::Char(c) => {
                             app.home_focus = HomeFocus::Search;
                             app.search_query.push(c);
@@ -444,7 +447,18 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                         }
                     }
                     View::ConfirmDelete => match key.code {
-                        KeyCode::Char('y') | KeyCode::Char('Y') => app.confirm_delete(),
+                        KeyCode::Up | KeyCode::Char('k') => app.delete_move(-1),
+                        KeyCode::Down | KeyCode::Char('j') => app.delete_move(1),
+                        KeyCode::Enter => app.confirm_delete_choice(),
+                        // The answers also have a letter each, for the hurried.
+                        KeyCode::Char('y') | KeyCode::Char('Y') => {
+                            app.delete_choice = 0;
+                            app.confirm_delete_choice();
+                        }
+                        KeyCode::Char('d') | KeyCode::Char('D') => {
+                            app.delete_choice = 1;
+                            app.confirm_delete_choice();
+                        }
                         _ => app.view = View::Torrents,
                     },
                     View::Discover => match key.code {
@@ -463,6 +477,20 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                         KeyCode::Char('D') => app.download_catalog_selected(true),
                         KeyCode::Char('f') => app.toggle_favorite(),
                         KeyCode::Char('b') => app.next_browse(),
+                        _ => {}
+                    },
+                    View::PickFolder => match key.code {
+                        KeyCode::Up | KeyCode::Char('k') => app.picker_move(-1),
+                        KeyCode::Down | KeyCode::Char('j') => app.picker_move(1),
+                        KeyCode::PageUp => app.picker_move(-10),
+                        KeyCode::PageDown => app.picker_move(10),
+                        KeyCode::Home => app.picker_move(isize::MIN / 2),
+                        KeyCode::End => app.picker_move(isize::MAX / 2),
+                        KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => app.picker_enter(),
+                        KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => app.picker_up(),
+                        KeyCode::Char('u') | KeyCode::Char(' ') => app.picker_use_this(),
+                        KeyCode::Char('t') => app.picker_to_input(),
+                        KeyCode::Esc | KeyCode::Char('q') => app.cancel_picker(),
                         _ => {}
                     },
                     View::Details => match key.code {
@@ -628,18 +656,8 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                         }
                         KeyCode::Enter | KeyCode::Char('l') => app.open_files(),
                         KeyCode::Char(' ') => app.toggle_pause(),
-                        KeyCode::Char('d') => {
-                            if n_rows > 0 {
-                                app.delete_with_files = false;
-                                app.view = View::ConfirmDelete;
-                            }
-                        }
-                        KeyCode::Char('D') => {
-                            if n_rows > 0 {
-                                app.delete_with_files = true;
-                                app.view = View::ConfirmDelete;
-                            }
-                        }
+                        KeyCode::Char('d') => app.ask_delete(false),
+                        KeyCode::Char('D') => app.ask_delete(true),
                         _ => {}
                     },
                 }

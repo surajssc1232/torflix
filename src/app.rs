@@ -66,6 +66,8 @@ pub struct TorrentRow {
 #[derive(PartialEq, Clone)]
 pub enum View {
     Home,
+    /// Choosing the folder a download lands in.
+    PickFolder,
     Torrents,
     Files,
     AddInput,
@@ -292,6 +294,9 @@ pub struct App {
 
     // Delete confirmation
     pub delete_with_files: bool,
+    /// Which row of the remove prompt is highlighted: 0 keep the files,
+    /// 1 delete them too, 2 cancel.
+    pub delete_choice: usize,
 
     // Search
     pub search_query: String,
@@ -372,6 +377,8 @@ pub struct App {
     pub input_return: View,
     /// Download waiting on the folder being typed into the popup.
     pub pending_download: Option<PendingDownload>,
+    /// The folder picker, while it's up.
+    pub picker: Option<crate::picker::Picker>,
     /// Download waiting on the open title's streams to resolve.
     pub awaiting_streams: Option<AwaitingStreams>,
 
@@ -410,6 +417,7 @@ impl App {
             file_selected: 0,
             input: String::new(),
             delete_with_files: false,
+            delete_choice: 0,
             search_query: String::new(),
             search: Arc::new(Mutex::new(SearchStatus::Idle)),
             search_selected: 0,
@@ -455,6 +463,7 @@ impl App {
             input_purpose: InputPurpose::Torrent,
             input_return: View::Torrents,
             pending_download: None,
+            picker: None,
             awaiting_streams: None,
             tv_channels: Arc::new(Mutex::new(Load::Idle)),
             tv_playlists: tv::load_config().playlists,
@@ -829,12 +838,99 @@ impl App {
     }
 
     /// `D` wherever `d` downloads: ask for the folder first.
+    /// `D`: choose where a download goes, by walking the folders rather than
+    /// typing a path.
     pub fn prompt_download_dest(&mut self) {
         let Some(pending) = self.pick_download() else { return };
-        let default = download_dir().join(safe_dir_name(&pending.label));
         self.pending_download = Some(pending);
+        self.open_picker();
+    }
+
+    fn open_picker(&mut self) {
+        let recents: Vec<std::path::PathBuf> = self
+            .config
+            .recent_dests
+            .iter()
+            .map(|d| crate::config::expand_tilde(d))
+            .filter(|d| d.is_dir())
+            .collect();
+        self.picker = Some(crate::picker::Picker::open(download_dir(), recents));
+        if self.view != View::PickFolder {
+            self.input_return = self.view.clone();
+        }
+        self.view = View::PickFolder;
+    }
+
+    /// Give up on choosing a folder.
+    pub fn cancel_picker(&mut self) {
+        self.picker = None;
+        self.pending_download = None;
+        self.view = self.input_return.clone();
+    }
+
+    /// Type the path instead, starting from the folder on screen.
+    pub fn picker_to_input(&mut self) {
+        let Some(p) = self.picker.take() else { return };
+        let label = self.pending_download.as_ref().map(|p| p.label.clone()).unwrap_or_default();
+        let dir = p.dir.join(safe_dir_name(&label));
+        self.view = self.input_return.clone();
         self.open_input(InputPurpose::DownloadTo);
-        self.input = default.display().to_string();
+        self.input = dir.display().to_string();
+    }
+
+    /// Act on the highlighted row; starts the download once a folder is taken.
+    pub fn picker_enter(&mut self) {
+        let Some(p) = self.picker.as_mut() else { return };
+        let Some(folder) = p.enter() else { return };
+        self.picker = None;
+        self.view = self.input_return.clone();
+        self.remember_dest(&folder);
+        let Some(pending) = self.pending_download.take() else { return };
+        let dest = folder.join(safe_dir_name(&pending.label));
+        match pending.target {
+            Some(target) => self.download_into(&target, &pending.label, pending.file_idx, dest),
+            None => self.wait_for_streams(pending.label, dest),
+        }
+    }
+
+    /// True when something is drawn over the screen underneath it. Pictures
+    /// aren't written while one is up: text over a cover would punch a hole in
+    /// it, so the screen is repainted plainly instead.
+    pub fn overlay_up(&self) -> bool {
+        self.show_help
+            || matches!(
+                self.view,
+                View::PickFolder | View::AddInput | View::ConfirmDelete | View::ConfirmQuit
+            )
+    }
+
+    pub fn picker_move(&mut self, delta: isize) {
+        if let Some(p) = self.picker.as_mut() {
+            p.move_by(delta);
+        }
+    }
+
+    pub fn picker_up(&mut self) {
+        if let Some(p) = self.picker.as_mut() {
+            p.up();
+        }
+    }
+
+    /// Take the folder on screen, wherever the highlight happens to be.
+    pub fn picker_use_this(&mut self) {
+        if let Some(p) = self.picker.as_mut() {
+            p.selected = 0;
+        }
+        self.picker_enter();
+    }
+
+    /// Keep the folder at the top of the picker's recent list.
+    fn remember_dest(&mut self, folder: &std::path::Path) {
+        let as_text = crate::config::tilde(folder);
+        self.config.recent_dests.retain(|d| *d != as_text);
+        self.config.recent_dests.insert(0, as_text);
+        self.config.recent_dests.truncate(crate::picker::RECENTS);
+        crate::config::save(&self.config);
     }
 
     /// `d` / `D` on a catalog title: open it, then download the best stream as
@@ -854,10 +950,8 @@ impl App {
         };
         self.open_details_for(item); // starts the stream lookup
         if ask_where {
-            let default = download_dir().join(safe_dir_name(&label));
             self.pending_download = Some(PendingDownload { target: None, label, file_idx: None });
-            self.open_input(InputPurpose::DownloadTo);
-            self.input = default.display().to_string();
+            self.open_picker();
             return;
         }
         let dest = download_dir().join(safe_dir_name(&label));
@@ -1591,9 +1685,15 @@ impl App {
         }
     }
 
+    /// The title under the cursor, on whichever grid of covers is showing.
     fn selected_catalog_item(&self) -> Option<MetaItem> {
-        match &*self.catalog.lock().unwrap() {
-            Load::Ready(v) => v.get(self.catalog_selected).cloned(),
+        let (list, at) = if self.view == View::Home {
+            (&self.home, self.home_selected)
+        } else {
+            (&self.catalog, self.catalog_selected)
+        };
+        match &*list.lock().unwrap() {
+            Load::Ready(v) => v.get(at).cloned(),
             _ => None,
         }
     }
@@ -2279,6 +2379,43 @@ impl App {
         self.ratings_line_for(&q, "")
     }
 
+    /// The three answers the remove prompt offers, in the order shown.
+    pub const DELETE_CHOICES: [&'static str; 3] = [
+        "yes — remove it, keep the files",
+        "yes — and delete the downloaded files",
+        "no — leave it alone",
+    ];
+
+    /// `d` on a download: ask what "remove" should mean this time.
+    pub fn ask_delete(&mut self, with_files: bool) {
+        if self.rows_snapshot().is_empty() {
+            return;
+        }
+        self.delete_with_files = with_files;
+        self.delete_choice = usize::from(with_files);
+        self.view = View::ConfirmDelete;
+    }
+
+    pub fn delete_move(&mut self, delta: isize) {
+        let last = Self::DELETE_CHOICES.len() - 1;
+        self.delete_choice = (self.delete_choice as isize + delta).clamp(0, last as isize) as usize;
+    }
+
+    /// Carry out whichever answer is highlighted.
+    pub fn confirm_delete_choice(&mut self) {
+        match self.delete_choice {
+            0 => {
+                self.delete_with_files = false;
+                self.confirm_delete();
+            }
+            1 => {
+                self.delete_with_files = true;
+                self.confirm_delete();
+            }
+            _ => self.view = View::Torrents,
+        }
+    }
+
     pub fn confirm_delete(&mut self) {
         let Some(row) = self.selected_row() else {
             return;
@@ -2838,6 +2975,26 @@ mod tests {
         assert!(!title_matches("The.Office.S01.Complete", "The Office", "2005–2013", true), "no episode tag");
         assert!(!title_matches("The Office", "The Office", "2005", true), "nothing after the name");
         assert!(title_matches("Grey's Anatomy S02E01", "Grey's Anatomy", "2005", true), "punctuation in the name");
+    }
+
+    #[test]
+    fn the_picker_offers_the_folders_used_most_recently_first() {
+        let dir = std::env::temp_dir().join(format!("torflix-dest-{}", std::process::id()));
+        std::env::set_var("TORFLIX_CONFIG_DIR", &dir);
+        let mut app = App::new(Client::new("http://127.0.0.1:1"));
+        for n in 0..7 {
+            app.remember_dest(std::path::Path::new(&format!("/tmp/d{n}")));
+        }
+        assert_eq!(
+            app.config.recent_dests,
+            ["/tmp/d6", "/tmp/d5", "/tmp/d4", "/tmp/d3", "/tmp/d2"],
+            "newest first, and no more than the picker shows"
+        );
+        // Using one again moves it back to the top rather than repeating it.
+        app.remember_dest(std::path::Path::new("/tmp/d3"));
+        assert_eq!(app.config.recent_dests[0], "/tmp/d3");
+        assert_eq!(app.config.recent_dests.iter().filter(|d| *d == "/tmp/d3").count(), 1);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Opening a title from the covers on the home screen and pressing Esc

@@ -107,7 +107,7 @@ torflix -d /mnt/nas/movies "magnet:?xt=urn:btih:..."
 | `j` / `k` / `↑` / `↓` | navigate |
 | `Enter` / `l` | stream selected result (temp dir, auto-deleted after playback) |
 | `d` | download permanently to `~/Downloads/torflix/<title>/` |
-| `D` | download into a folder you type |
+| `D` | pick the folder to download into |
 | `f` | preview file list before committing |
 | `/` | open filter bar — type to narrow results by title substring |
 | `o` | cycle sort: seeders → name → size |
@@ -132,7 +132,7 @@ Fetches the torrent's file list from peers before you commit to streaming.
 | `j` / `k` | navigate files |
 | `Enter` / `l` | stream selected file |
 | `d` | download whole torrent to disk |
-| `D` | download it into a folder you type |
+| `D` | pick the folder to download it into |
 | `o` | sort files: name → size |
 | `f` / `Esc` | close preview |
 
@@ -144,8 +144,8 @@ Fetches the torrent's file list from peers before you commit to streaming.
 | `j` / `k` | navigate |
 | `Enter` / `l` | open file list |
 | `Space` | pause / resume |
-| `d` | remove torrent (keep files) |
-| `D` | remove torrent and delete files |
+| `d` | remove — asks whether to delete the files too |
+| `D` | remove, with deleting the files already chosen |
 | `s` / `Esc` | back to home / search |
 | `Tab` / `H` | go to history |
 | `q` | quit (asks whether to keep downloads going in the background) |
@@ -169,7 +169,7 @@ Everything you stream or download is remembered, newest first.
 | `j` / `k` | navigate |
 | `Enter` / `l` | stream it again |
 | `d` | download permanently |
-| `D` | download into a folder you type |
+| `D` | pick the folder to download into |
 | `x` | remove from history |
 | `Tab` / `Esc` | back to home |
 
@@ -255,6 +255,10 @@ Covers are **real pictures** where the terminal can draw them. At startup torfli
 
 Terminals that can't do sixel fall back to half-block characters: one character cell carries two pixels, its foreground colour painting the top and its background the bottom. That needs no graphics protocol and works anywhere 24-bit colour does, at a fraction of the detail — a 16-cell cover is 16×24 pixels as blocks against roughly 192×312 as a picture.
 
+### Choosing where a download goes
+
+`D` opens a folder picker rather than a prompt to type a path: the folders inside the download folder, one per line, with the folder you're standing in as the first row. `↑↓` moves, `Enter` or `→` goes into a folder, `←` goes back up, `u` takes the folder on screen whatever is highlighted, and the five folders used most recently are offered at the top until you walk somewhere. `t` still gives you the text prompt if you would rather type, and `Esc` cancels. The download gets its own folder inside whichever one you choose.
+
 Set `TORFLIX_SIXEL=0` to force the half-blocks, or `=1` to insist on pictures if the probe gets it wrong. Inside tmux or screen the fallback is always used. Covers are cached under `~/.cache/torflix/posters`.
 
 Each cover carries its ★ **Letterboxd** rating out of five, in green, and so does a title's details. Letterboxd has no public API, so torflix does what [digital-drop-movies](https://digital-drop-movies.netlify.app/) does: `letterboxd.com/imdb/<id>/` redirects to the film's page, which embeds its `ratingValue` and `ratingCount` as JSON-LD. The page is ~310 KB, but gzipped it's about 43 KB — the size of a poster — so it is asked for compressed, fetched only for covers actually on screen (at most six covers and ratings at a time), and cached for a week under `~/.cache/torflix/letterboxd`.
@@ -265,7 +269,7 @@ Each cover carries its ★ **Letterboxd** rating out of five, in green, and so d
 | `Tab` / `←` `→` | move between the seasons, episodes and streams panes |
 | `f` | star / unstar |
 | `d` | download the selected stream |
-| `D` | download it into a folder you type |
+| `D` | pick the folder to download it into |
 | `t` | search the torrent indexers for this title instead |
 
 On the catalog list itself, `d` downloads a movie's best stream without opening it first, and `D` does the same after asking where to put it. A series has no single thing to download, so open it and pick an episode.
