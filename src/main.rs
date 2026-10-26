@@ -10,6 +10,7 @@ mod posters;
 mod progress;
 mod rqbit;
 mod search;
+mod signals;
 mod sixel;
 mod stremio;
 mod term;
@@ -116,6 +117,9 @@ fn main() -> Result<()> {
         app.add_and_play_async(&arg, &label);
     }
 
+    // Closing the terminal must hand the downloads over, not drop them.
+    signals::listen();
+
     enable_raw_mode()?;
     // Before anything else reads stdin: the terminal answers on it.
     app.caps = term::probe();
@@ -133,9 +137,11 @@ fn main() -> Result<()> {
 
     let res = run(&mut terminal, &mut app);
 
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableBracketedPaste)?;
-    terminal.show_cursor()?;
+    // Cosmetic, and the terminal may already be gone — never let tidying up
+    // stand between a hangup and the handoff below.
+    let _ = disable_raw_mode();
+    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableBracketedPaste);
+    let _ = terminal.show_cursor();
 
     let active = app.active_download_count();
     if let Some(mut e) = embedded_engine {
@@ -227,6 +233,13 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
             app.maybe_fetch_search_ratings();
         }
 
+        if signals::caught() {
+            // The terminal is going away. Leave quietly, keeping whatever is
+            // still downloading alive in the background.
+            app.keep_downloading = app.embedded && app.active_download_count() > 0;
+            return Ok(());
+        }
+
         app.tick = app.tick.wrapping_add(1);
         terminal.draw(|f| ui::draw(f, app))?;
         // A cover that moved takes the whole screen with it; draw it back
@@ -236,7 +249,14 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
             flush_images(terminal, app)?;
         }
 
-        if !event::poll(Duration::from_millis(250))? {
+        let ready = match event::poll(Duration::from_millis(250)) {
+            Ok(ready) => ready,
+            // A signal cuts the wait short; the check at the top of the loop
+            // decides what to make of it.
+            Err(_) if signals::caught() => continue,
+            Err(e) => return Err(e.into()),
+        };
+        if !ready {
             continue;
         }
         match event::read()? {

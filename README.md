@@ -308,6 +308,8 @@ Downloads survive quitting. Press `q` with downloads still running and torflix a
 - **`y`** — keep downloading in the background. A headless engine takes over, and stops itself once everything has finished.
 - **`n`** — quit now. Unfinished downloads pause and resume where they left off the next time you open torflix.
 
+**Closing the terminal counts as `y`.** A terminal window closing sends SIGHUP, and a logout or `kill` sends SIGTERM; torflix catches both, hands whatever is still downloading to the background engine and exits cleanly, rather than taking the engine down with it. Nothing is lost if you simply close the window on it.
+
 Open torflix again while background downloads are running and it connects to them, so you can keep watching progress. To stop them:
 
 ```bash
