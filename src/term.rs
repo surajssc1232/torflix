@@ -96,6 +96,46 @@ fn ask(query: &str, ms: u64) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
+/// Wait up to `wait` for a key, or answer `None` if the terminal has hung up.
+///
+/// crossterm can't be left to notice a hangup itself: a dead terminal reads as
+/// zero bytes, and its read loop only stops on `WouldBlock`, so it would spin
+/// forever without ever coming back to us. Look at stdin before it gets to.
+#[cfg(unix)]
+pub fn wait_for_key(wait: std::time::Duration) -> std::io::Result<Option<bool>> {
+    use crossterm::event;
+    use std::time::Duration;
+
+    // Input redirected from a file or pipe is always "readable", so polling it
+    // wouldn't wait; crossterm reads /dev/tty in that case anyway.
+    if unsafe { libc::isatty(0) } != 1 {
+        return event::poll(wait).map(Some);
+    }
+    let hung_up = |ms: libc::c_int| {
+        let mut pfd = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
+        // A signal cutting this short reads as "no key yet", which is fine:
+        // the caller goes back to the top of its loop and sees the signal.
+        unsafe { libc::poll(&mut pfd, 1, ms) };
+        pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+    };
+    if hung_up(0) {
+        return Ok(None);
+    }
+    // The last read may have left keys queued that stdin knows nothing about.
+    if event::poll(Duration::ZERO)? {
+        return Ok(Some(true));
+    }
+    if hung_up(wait.as_millis() as libc::c_int) {
+        return Ok(None);
+    }
+    event::poll(Duration::ZERO).map(Some)
+}
+
+#[cfg(not(unix))]
+pub fn wait_for_key(wait: std::time::Duration) -> std::io::Result<Option<bool>> {
+    crossterm::event::poll(wait).map(Some)
+}
+
 #[cfg(not(unix))]
 fn ask(_query: &str, _ms: u64) -> String {
     String::new()

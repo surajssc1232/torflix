@@ -9,14 +9,34 @@
 //! does the one thing that is always safe, setting a flag, and the draw loop
 //! picks it up and quits the ordinary way, which hands the downloads to the
 //! background daemon on the way out.
+//!
+//! SIGTERM is the exception to the handoff: it means the session or the whole
+//! machine is going down. A daemon started now would miss that signal, and
+//! systemd would then sit waiting for it until its stop timeout ran out.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 static CAUGHT: AtomicBool = AtomicBool::new(false);
+static TERMINATING: AtomicBool = AtomicBool::new(false);
+
+/// How long quitting may take once a signal has arrived, before giving up on
+/// tidiness. Fastresume state can be rebuilt; a held-up shutdown can't be undone.
+const GRACE: Duration = Duration::from_secs(10);
 
 /// True once a signal asking torflix to go away has arrived.
 pub fn caught() -> bool {
     CAUGHT.load(Ordering::SeqCst)
+}
+
+/// True if that signal was SIGTERM, so nothing should be left running.
+pub fn terminating() -> bool {
+    TERMINATING.load(Ordering::SeqCst)
+}
+
+/// The terminal hung up without a signal reaching us. Same meaning as SIGHUP.
+pub fn terminal_gone() {
+    CAUGHT.store(true, Ordering::SeqCst);
 }
 
 /// Start listening. Call once, before the draw loop.
@@ -32,6 +52,13 @@ pub fn listen() {
             libc::sigaction(sig, &action, std::ptr::null_mut());
         }
     }
+    std::thread::spawn(|| {
+        while !caught() {
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        std::thread::sleep(GRACE);
+        unsafe { libc::_exit(0) };
+    });
 }
 
 #[cfg(not(unix))]
@@ -39,7 +66,10 @@ pub fn listen() {}
 
 /// Setting an atomic is one of the few things a handler may safely do.
 #[cfg(unix)]
-extern "C" fn on_signal(_sig: libc::c_int) {
+extern "C" fn on_signal(sig: libc::c_int) {
+    if sig == libc::SIGTERM {
+        TERMINATING.store(true, Ordering::SeqCst);
+    }
     CAUGHT.store(true, Ordering::SeqCst);
 }
 

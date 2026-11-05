@@ -153,27 +153,38 @@ fn main() -> Result<()> {
         e.stop();
         if app.keep_downloading {
             match daemon::spawn_detached() {
-                Ok(()) => println!(
+                Ok(()) => say(&format!(
                     "torflix: {} download(s) continuing in the background.\n  \
                      Open torflix to check on them, or run `torflix --stop` to stop them.",
                     active
-                ),
-                Err(err) => eprintln!(
+                )),
+                Err(err) => say(&format!(
                     "torflix: couldn't keep downloading in the background ({err:#}).\n  \
                      They'll resume next time you open torflix."
-                ),
+                )),
             }
         } else if active > 0 {
-            println!(
+            say(&format!(
                 "torflix: {} unfinished download(s) paused — they'll resume next time you open torflix.",
                 active
-            );
+            ));
         }
     } else if app.stop_engine_on_quit && daemon::request_stop() {
-        println!("torflix: background downloads stopped — they'll resume next time you open torflix.");
+        say("torflix: background downloads stopped — they'll resume next time you open torflix.");
+    }
+
+    // Dropping the terminal complains on stderr if it can't restore the cursor,
+    // and that panics when the terminal is already gone.
+    if signals::caught() {
+        std::mem::forget(terminal);
     }
 
     res
+}
+
+/// A parting message. The terminal may be gone by now, and println! would panic.
+fn say(msg: &str) {
+    let _ = writeln!(io::stdout(), "{msg}");
 }
 
 /// Write the covers the frame left room for.
@@ -239,8 +250,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
 
         if signals::caught() {
             // The terminal is going away. Leave quietly, keeping whatever is
-            // still downloading alive in the background.
-            app.keep_downloading = app.embedded && app.active_download_count() > 0;
+            // still downloading alive in the background, unless the whole
+            // session is going with it.
+            app.keep_downloading =
+                app.embedded && !signals::terminating() && app.active_download_count() > 0;
             return Ok(());
         }
 
@@ -253,8 +266,12 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
             flush_images(terminal, app)?;
         }
 
-        let ready = match event::poll(Duration::from_millis(250)) {
-            Ok(ready) => ready,
+        let ready = match term::wait_for_key(Duration::from_millis(250)) {
+            Ok(Some(ready)) => ready,
+            Ok(None) => {
+                signals::terminal_gone();
+                continue;
+            }
             // A signal cuts the wait short; the check at the top of the loop
             // decides what to make of it.
             Err(_) if signals::caught() => continue,
