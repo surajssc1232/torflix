@@ -377,6 +377,11 @@ pub struct App {
     pub frame_images: std::cell::RefCell<Vec<Placed>>,
     /// The pictures currently on screen, so only what moved is redrawn.
     pub shown_images: Vec<Placed>,
+    /// Watchlist films already being matched to a title, so a film on screen
+    /// for many frames is only looked up once.
+    resolving: Arc<Mutex<HashSet<String>>>,
+    /// Set when the next watchlist load should ignore what's on disk.
+    watchlist_refresh: bool,
     /// Letterboxd ratings for titles on screen, keyed by IMDb id.
     pub lb_ratings: Arc<Mutex<HashMap<String, Load<Option<letterboxd::Rating>>>>>,
     /// Covers and ratings being fetched right now, so a screenful of tiles
@@ -475,6 +480,8 @@ impl App {
             frame_images: std::cell::RefCell::new(Vec::new()),
             shown_images: Vec::new(),
             lb_ratings: Arc::new(Mutex::new(HashMap::new())),
+            resolving: Arc::new(Mutex::new(HashSet::new())),
+            watchlist_refresh: false,
             inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             grid_cols: std::cell::Cell::new(1),
             input_purpose: InputPurpose::Torrent,
@@ -1479,6 +1486,18 @@ impl App {
             Some(SlashCommand::History) => self.open_history(),
             Some(SlashCommand::Downloads) => self.view = View::Torrents,
             Some(SlashCommand::Tidy) => self.tidy_downloads(),
+            Some(SlashCommand::Watchlist) => {
+                // Everything after the command is the username.
+                let user = input.trim().split_once(char::is_whitespace).map(|(_, u)| u).unwrap_or("");
+                match (user.is_empty(), self.config.letterboxd_user.clone()) {
+                    (true, Some(who)) => {
+                        self.status = format!("watchlist: {who} — /letterboxd <username> to change it, /sync to refresh");
+                    }
+                    (true, None) => self.status = "/letterboxd <username> — your Letterboxd watchlist, if it's public".into(),
+                    (false, _) => self.set_letterboxd_user(user),
+                }
+            }
+            Some(SlashCommand::Sync) => self.sync_watchlist(),
             Some(SlashCommand::Help) => self.show_help = true,
             Some(SlashCommand::Quit) => self.request_quit(),
             Some(SlashCommand::Tv) => self.open_tv(),
@@ -1522,12 +1541,19 @@ impl App {
     /// again when the list is cycled.
     pub fn load_home(&mut self, which: usize) {
         let targets = stremio::browse_targets(&self.addons);
-        if targets.is_empty() {
+        // The watchlist, when there is one, sits after Cinemeta's own lists.
+        let watchlist = self.config.letterboxd_user.is_some();
+        let total = targets.len() + usize::from(watchlist);
+        if total == 0 {
             return; // Cinemeta disabled — the home screen is just the search box
         }
-        let which = which % targets.len();
+        let which = which % total;
         self.home_list = which;
         self.home_selected = 0;
+        if which >= targets.len() {
+            self.load_watchlist();
+            return;
+        }
         let target = targets[which].clone();
         self.home_title = target.label.to_lowercase();
         let slot = Arc::new(Mutex::new(Load::Loading));
@@ -1564,6 +1590,105 @@ impl App {
 
     /// Move through the covers; `delta` of ±1 steps sideways, ±columns a row.
     /// Going up off the top row puts the cursor back in the search box.
+    /// Load the watchlist as a row of covers.
+    ///
+    /// The films arrive as names and years, which is all Letterboxd's pages
+    /// carry, so each one goes up as a placeholder tile and is matched to a
+    /// real title in the background — see [`Self::resolve_watchlist_item`].
+    fn load_watchlist(&mut self) {
+        let Some(user) = self.config.letterboxd_user.clone() else { return };
+        self.home_title = format!("{user}'s watchlist");
+        let slot = Arc::new(Mutex::new(Load::Loading));
+        self.home = Arc::clone(&slot);
+        let force = std::mem::take(&mut self.watchlist_refresh);
+        thread::spawn(move || {
+            let result = match crate::watchlist::fetch(&user, force) {
+                Ok(films) => Load::Ready(films.iter().map(unmatched_item).collect()),
+                Err(e) => Load::Failed(format!("{e:#}")),
+            };
+            *slot.lock().unwrap() = result;
+        });
+    }
+
+    /// `/letterboxd <user>`: whose watchlist to show. An empty name drops it.
+    pub fn set_letterboxd_user(&mut self, user: &str) {
+        let user = user.trim().trim_start_matches('@').trim_matches('/');
+        self.config.letterboxd_user = (!user.is_empty()).then(|| user.to_string());
+        crate::config::save(&self.config);
+        self.status = match &self.config.letterboxd_user {
+            Some(u) => format!("watchlist: {u} — Tab on the covers to reach it"),
+            None => "watchlist removed".into(),
+        };
+        if self.config.letterboxd_user.is_some() {
+            self.watchlist_refresh = true;
+            let last = stremio::browse_targets(&self.addons).len();
+            self.load_home(last);
+        }
+    }
+
+    /// `/sync`: fetch the watchlist again rather than using what's on disk.
+    pub fn sync_watchlist(&mut self) {
+        if self.config.letterboxd_user.is_none() {
+            self.status = "no watchlist set — try /letterboxd <username>".into();
+            return;
+        }
+        self.watchlist_refresh = true;
+        self.status = "⧗ fetching your watchlist…".into();
+        let last = stremio::browse_targets(&self.addons).len();
+        self.load_home(last);
+    }
+
+    /// Match one watchlist film to a real title, in the background.
+    ///
+    /// Called for the tiles on screen, so a watchlist of hundreds only costs
+    /// lookups for the dozen or so being looked at.
+    pub fn resolve_watchlist_item(&self, item: &MetaItem) {
+        let Some(slug) = item.id.strip_prefix(UNMATCHED) else { return };
+        if let Some(found) = crate::config::load_json_opt::<MetaItem>(&matched_path(slug)) {
+            self.replace_item(&item.id, found);
+            return;
+        }
+        if !self.resolving.lock().unwrap().insert(item.id.clone()) {
+            return;
+        }
+        if !self.start_fetch() {
+            self.resolving.lock().unwrap().remove(&item.id);
+            return;
+        }
+        let (addons, home, busy) = (
+            self.addons.clone(),
+            Arc::clone(&self.home),
+            Arc::clone(&self.inflight),
+        );
+        let (id, name, year, slug) = (
+            item.id.clone(),
+            item.name.clone(),
+            item.year_label(),
+            slug.to_string(),
+        );
+        thread::spawn(move || {
+            let results = stremio::search(&addons, &name).unwrap_or_default();
+            if let Some(found) = pick_match(&results, &name, &year) {
+                crate::config::write_json(&matched_path(&slug), &found);
+                if let Load::Ready(items) = &mut *home.lock().unwrap() {
+                    if let Some(slot) = items.iter_mut().find(|i| i.id == id) {
+                        *slot = found;
+                    }
+                }
+            }
+            busy.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        });
+    }
+
+    /// Swap a placeholder for the title it turned out to be.
+    fn replace_item(&self, id: &str, found: MetaItem) {
+        if let Load::Ready(items) = &mut *self.home.lock().unwrap() {
+            if let Some(slot) = items.iter_mut().find(|i| i.id == id) {
+                *slot = found;
+            }
+        }
+    }
+
     pub fn home_move(&mut self, delta: isize) {
         let n = self.home_items().len();
         if n == 0 {
@@ -1629,6 +1754,10 @@ impl App {
     /// Letterboxd's rating for a title on screen, fetched the first time it's
     /// asked for. `None` until it lands — the tile just shows no number yet.
     pub fn rating(&self, imdb_id: &str) -> Option<letterboxd::Rating> {
+        // A watchlist film that hasn't been matched yet has no IMDb id to ask about.
+        if !imdb_id.starts_with("tt") {
+            return None;
+        }
         if !imdb_id.starts_with("tt") {
             return None;
         }
@@ -2948,6 +3077,56 @@ fn spawn_player(player_cmd: &str, url: &str, title: &str, opts: &PlayOpts) -> st
 /// Where to find a title's cover. Cinemeta gives one for catalog entries;
 /// anything else carrying an IMDb id (favorites, for one) can be looked up by
 /// that id instead.
+/// Marks a watchlist film that hasn't been matched to a title yet.
+pub const UNMATCHED: &str = "lb:";
+
+/// A watchlist film as a tile, before anything is known about it but its name.
+fn unmatched_item(film: &crate::watchlist::Entry) -> MetaItem {
+    MetaItem {
+        id: format!("{UNMATCHED}{}", film.slug),
+        kind: "movie".into(),
+        name: film.name.clone(),
+        poster: None,
+        release_info: (!film.year.is_empty()).then(|| film.year.clone()),
+        imdb_rating: None,
+        genres: Vec::new(),
+        description: None,
+    }
+}
+
+fn matched_path(slug: &str) -> std::path::PathBuf {
+    crate::config::cache_dir()
+        .join("letterboxd")
+        .join("films")
+        .join(format!("{}.json", crate::config::safe_file_name(slug)))
+}
+
+/// Which search result is the watchlist film, if any.
+///
+/// Letterboxd gives a year with almost every film, and it settles the many
+/// cases where the same title has been made more than once. Without one, the
+/// closest name wins.
+fn pick_match(results: &[MetaItem], name: &str, year: &str) -> Option<MetaItem> {
+    let same_name = |m: &MetaItem| m.name.trim().eq_ignore_ascii_case(name.trim());
+    if !year.is_empty() {
+        if let Some(m) = results.iter().find(|m| same_name(m) && m.year_label() == year) {
+            return Some(m.clone());
+        }
+        // A year either side: release years differ between databases.
+        if let Some(m) = results.iter().find(|m| {
+            same_name(m) && year_distance(&m.year_label(), year).is_some_and(|d| d <= 1)
+        }) {
+            return Some(m.clone());
+        }
+    }
+    results.iter().find(|m| same_name(m)).or_else(|| results.first()).cloned()
+}
+
+fn year_distance(a: &str, b: &str) -> Option<u32> {
+    let (a, b) = (a.get(..4)?.parse::<i32>().ok()?, b.get(..4)?.parse::<i32>().ok()?);
+    Some(a.abs_diff(b))
+}
+
 pub fn poster_url(item: &MetaItem) -> Option<String> {
     if let Some(p) = item.poster.as_ref().filter(|p| !p.is_empty()) {
         return Some(p.clone());
@@ -3208,6 +3387,56 @@ mod tests {
         assert!(!takes_subtitles_later("vlc"));
         assert!(!takes_subtitles_later("/usr/bin/vlc --no-one-instance"));
         assert!(!takes_subtitles_later(""));
+    }
+
+    fn meta(id: &str, name: &str, year: &str) -> MetaItem {
+        MetaItem {
+            id: id.into(),
+            kind: "movie".into(),
+            name: name.into(),
+            poster: None,
+            release_info: Some(year.into()),
+            imdb_rating: None,
+            genres: Vec::new(),
+            description: None,
+        }
+    }
+
+    #[test]
+    fn the_year_decides_between_films_of_the_same_name() {
+        let results = vec![
+            meta("tt0075860", "Carrie", "1976"),
+            meta("tt1939659", "Carrie", "2013"),
+            meta("tt9999999", "Carrie Pilby", "2016"),
+        ];
+        assert_eq!(pick_match(&results, "Carrie", "2013").unwrap().id, "tt1939659");
+        assert_eq!(pick_match(&results, "Carrie", "1976").unwrap().id, "tt0075860");
+        // Databases disagree about release years by a year often enough.
+        assert_eq!(pick_match(&results, "Carrie", "2014").unwrap().id, "tt1939659");
+        // No year: the exact name wins over the one that merely starts with it.
+        assert_eq!(pick_match(&results, "Carrie", "").unwrap().id, "tt0075860");
+    }
+
+    #[test]
+    fn a_film_with_no_exact_match_falls_back_to_the_closest_result() {
+        let results = vec![meta("tt1", "The Thing from Another World", "1951")];
+        assert_eq!(pick_match(&results, "The Thing", "1982").unwrap().id, "tt1");
+        assert!(pick_match(&[], "Anything", "2020").is_none());
+    }
+
+    #[test]
+    fn a_watchlist_film_is_a_tile_before_it_is_matched() {
+        let film = crate::watchlist::Entry {
+            name: "Black Bag".into(),
+            year: "2025".into(),
+            slug: "black-bag-2025".into(),
+        };
+        let item = unmatched_item(&film);
+        assert_eq!(item.id, "lb:black-bag-2025");
+        assert!(item.id.starts_with(UNMATCHED));
+        assert_eq!(item.name, "Black Bag");
+        assert_eq!(item.year_label(), "2025");
+        assert!(item.poster.is_none(), "nothing to draw until it's matched");
     }
 
     #[test]

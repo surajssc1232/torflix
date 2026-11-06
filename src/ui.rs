@@ -262,6 +262,9 @@ fn draw_cover_grid(
             continue;
         }
         let picked = idx == selected;
+        // A watchlist film on screen gets matched to a real title; until then
+        // the tile is its name on a plain panel.
+        app.resolve_watchlist_item(item);
         draw_cover(f, Rect { x, y, width: COVER_W, height: cover_h }, app, item, picked && focused);
 
         let title_style = if picked {

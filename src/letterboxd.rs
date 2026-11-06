@@ -95,9 +95,9 @@ pub fn fetch(imdb_id: &str) -> Result<Option<Rating>> {
     Ok(rating)
 }
 
-/// Undo the gzip Letterboxd was asked for. Anything that isn't gzipped is
+/// Undo the gzip Letterboxd was asked for. Shared with [`crate::watchlist`]. Anything that isn't gzipped is
 /// already the page itself.
-fn gunzip(body: &[u8]) -> String {
+pub fn gunzip(body: &[u8]) -> String {
     if body.starts_with(&[0x1f, 0x8b]) {
         let mut out = String::new();
         if std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(body), &mut out).is_ok() {

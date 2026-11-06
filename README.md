@@ -255,6 +255,18 @@ Covers are **real pictures** where the terminal can draw them. At startup torfli
 
 Terminals that can't do sixel fall back to half-block characters: one character cell carries two pixels, its foreground colour painting the top and its background the bottom. That needs no graphics protocol and works anywhere 24-bit colour does, at a fraction of the detail — a 16-cell cover is 16×24 pixels as blocks against roughly 192×312 as a picture.
 
+### Your Letterboxd watchlist
+
+```
+/letterboxd <username>
+```
+
+Adds your watchlist as a list on the home row, after Cinemeta's own — `Tab` cycles to it. `/sync` fetches it again; otherwise it's kept for six hours.
+
+Letterboxd's write API is invite-only, but a public watchlist is ordinary HTML: `letterboxd.com/<user>/watchlist/page/<n>/` lists 28 films a page, each carrying its name, year and slug in the markup. That's enough to find the film in Cinemeta afterwards, so a watchlist of 650 films costs 23 gzipped pages (~23 KB each) and no per-film request. Each film is then matched to a real title in the background, but only for the tiles actually on screen, so the rest of the list costs nothing until you scroll to it. The year settles which *Carrie* you meant.
+
+Once matched, a watchlist film behaves like any other title: cover, ★ Letterboxd rating, `Enter` for streams, `d` / `D` to download. It's read-only — torflix can't tick films off your list — and the watchlist has to be public, or Letterboxd returns a 404 and torflix says so.
+
 ### Choosing where a download goes
 
 `D` opens a folder picker rather than a prompt to type a path: the folders inside the download folder, one per line, with the folder you're standing in as the first row. `↑↓` moves, `Enter` or `→` goes into a folder, `←` goes back up, `u` takes the folder on screen whatever is highlighted, and the five folders used most recently are offered at the top until you walk somewhere. `t` still gives you the text prompt if you would rather type, and `Esc` cancels. The download gets its own folder inside whichever one you choose.
@@ -298,6 +310,8 @@ Type these in the home search box:
 | `/history` | everything you've watched or downloaded |
 | `/downloads` | torrents in progress |
 | `/tidy` | move finished downloads that landed loose into a folder each |
+| `/letterboxd <user>` | show that Letterboxd watchlist on the home row |
+| `/sync` | fetch the watchlist again rather than using the saved copy |
 | `/tv` | live TV from M3U playlists — `a` add a URL or file, `/` filter, `m` manage |
 | `/addons` | install, enable or remove Stremio addons |
 | `/settings` | player, subtitle language, download folder, default search |

@@ -47,6 +47,9 @@ pub struct Config {
     /// Folders recently downloaded into, most recent first, for the picker.
     #[serde(default)]
     pub recent_dests: Vec<String>,
+    /// Letterboxd username whose watchlist to show, if any.
+    #[serde(default)]
+    pub letterboxd_user: Option<String>,
 }
 
 impl Default for Config {
@@ -57,6 +60,7 @@ impl Default for Config {
             subtitle_lang: "eng".into(),
             search_source: SearchSource::Torrents,
             recent_dests: Vec::new(),
+            letterboxd_user: None,
         }
     }
 }
@@ -126,6 +130,22 @@ pub fn data_dir() -> PathBuf {
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("torflix")
+}
+
+/// How torflix identifies itself to the sites it fetches from.
+pub const USER_AGENT: &str = concat!("torflix/", env!("CARGO_PKG_VERSION"));
+
+/// A name safe to use as a file name, for keys that come from outside.
+pub fn safe_file_name(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .take(64)
+        .collect()
+}
+
+/// Read a JSON file, or `None` when it isn't there or doesn't parse.
+pub fn load_json_opt<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Option<T> {
+    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
 }
 
 pub fn cache_dir() -> PathBuf {

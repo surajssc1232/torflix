@@ -7,6 +7,8 @@ pub enum Command {
     History,
     Downloads,
     Tidy,
+    Watchlist,
+    Sync,
     Tv,
     Addons,
     Settings,
@@ -15,12 +17,14 @@ pub enum Command {
 }
 
 impl Command {
-    pub const ALL: [Command; 10] = [
+    pub const ALL: [Command; 12] = [
         Command::Browse,
         Command::Favorites,
         Command::History,
         Command::Downloads,
         Command::Tidy,
+        Command::Watchlist,
+        Command::Sync,
         Command::Tv,
         Command::Addons,
         Command::Settings,
@@ -35,6 +39,8 @@ impl Command {
             Command::History => "/history",
             Command::Downloads => "/downloads",
             Command::Tidy => "/tidy",
+            Command::Watchlist => "/letterboxd",
+            Command::Sync => "/sync",
             Command::Tv => "/tv",
             Command::Addons => "/addons",
             Command::Settings => "/settings",
@@ -50,6 +56,8 @@ impl Command {
             Command::History => "everything you've watched or downloaded",
             Command::Downloads => "torrents in progress",
             Command::Tidy => "give finished downloads sitting loose their own folder",
+            Command::Watchlist => "/letterboxd <username> — show that watchlist on the home row",
+            Command::Sync => "fetch your Letterboxd watchlist again",
             Command::Tv => "live TV from M3U playlists",
             Command::Addons => "manage Stremio addons (streams, subtitles)",
             Command::Settings => "player, subtitles, download folder",
@@ -66,6 +74,8 @@ impl Command {
             "/history" => Command::History,
             "/downloads" | "/dl" => Command::Downloads,
             "/tidy" | "/organize" | "/organise" => Command::Tidy,
+            "/letterboxd" | "/watchlist" | "/lb" => Command::Watchlist,
+            "/sync" | "/refresh" => Command::Sync,
             "/tv" | "/live" => Command::Tv,
             "/addons" | "/addon" => Command::Addons,
             "/settings" | "/config" | "/prefs" => Command::Settings,

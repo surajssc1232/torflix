@@ -16,6 +16,7 @@ mod sixel;
 mod stremio;
 mod term;
 mod tv;
+mod watchlist;
 mod ui;
 
 use anyhow::Result;
