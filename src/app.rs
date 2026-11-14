@@ -5,6 +5,7 @@ use crate::omdb;
 use crate::commands::Command as SlashCommand;
 use crate::config::SearchSource;
 use crate::favorites;
+use crate::playing::{self, Stage};
 use crate::progress;
 use crate::stremio::{self, Addon, MetaItem, Source, Stream};
 use crate::tv;
@@ -249,8 +250,6 @@ impl SubtitleQuery {
 const SUBTITLE_WAIT: Duration = Duration::from_secs(4);
 /// How long the background lookup is given before it's given up on.
 const SUBTITLE_LOOKUP_LIMIT: Duration = Duration::from_secs(30);
-/// How long to wait for mpv to open its IPC socket after starting.
-const PLAYER_IPC_WAIT: Duration = Duration::from_secs(10);
 
 /// Subtitles handed to mpv: the best first, the rest a keypress (j) away if it's off.
 const MAX_SUBTITLES: usize = 4;
@@ -418,6 +417,8 @@ pub struct App {
     pub settings_selected: usize,
     /// Auto-detected player, looked up when settings open (probing runs a process).
     pub detected_player: Option<String>,
+    /// What's starting or playing, for the panel along the bottom.
+    pub now_playing: playing::Slot,
 }
 
 impl App {
@@ -500,6 +501,7 @@ impl App {
             installed_addon: Arc::new(Mutex::new(None)),
             settings_selected: 0,
             detected_player: None,
+            now_playing: playing::Slot::default(),
         }
     }
 
@@ -593,23 +595,32 @@ impl App {
             .map(|r| r.info_hash)
             .unwrap_or_default();
         let opts = PlayOpts::resuming(progress::torrent_key(&format!("magnet:?xt=urn:btih:{hash}"), stream_idx));
-        self.launch_player(&url, &title, &opts);
+        self.launch_player(&url, &title, opts, Some(self.files_torrent_id));
     }
 
     pub fn play_playlist(&mut self) {
         let url = self.client.playlist_url(self.files_torrent_id);
         let title = self.files_torrent_name.clone();
-        self.launch_player(&url, &title, &PlayOpts::default());
+        self.launch_player(&url, &title, PlayOpts::default(), Some(self.files_torrent_id));
     }
 
-    fn launch_player(&mut self, url: &str, title: &str, opts: &PlayOpts) {
+    fn launch_player(&mut self, url: &str, title: &str, mut opts: PlayOpts, torrent: Option<u64>) {
         let Some(player_cmd) = find_player() else {
             self.status =
                 "✗ no player found — install mpv or vlc, or set TORFLIX_PLAYER".into();
             return;
         };
-        match spawn_player(&player_cmd, url, title, opts) {
-            Ok(_) => self.status = format!("▶ playing: {}{} — buffering may take a moment", title, opts.resume_note()),
+        opts.ipc = player_socket(&player_cmd);
+        let playback = self.now_playing.begin(title, Stage::Starting);
+        if let Some(id) = torrent {
+            playback.torrent(id);
+        }
+        match spawn_player(&player_cmd, url, title, &opts) {
+            Ok(child) => {
+                self.status = format!("▶ playing: {}{} — buffering may take a moment", title, opts.resume_note());
+                playback.follow(opts.ipc.clone());
+                see_out(child, playback, opts.ipc);
+            }
             Err(e) => self.status = format!("✗ couldn't launch '{}': {}", player_cmd, e),
         }
     }
@@ -681,6 +692,8 @@ impl App {
         history::record(&label, &target, HistoryKind::Stream, None);
         self.status = format!("⧗ adding: {} …", label);
         let stream_ids = Arc::clone(&self.stream_ids);
+        // Owned by the thread: however it ends, the panel goes with it.
+        let playback = self.now_playing.begin(&label, Stage::Adding);
 
         thread::spawn(move || {
             // Look subtitles up while the torrent's metadata resolves, not after.
@@ -704,6 +717,8 @@ impl App {
                 }
             };
             stream_ids.lock().unwrap().insert(id);
+            playback.torrent(id);
+            playback.stage(Stage::Metadata);
             let _ = tx.send("⧗ resolving metadata…".into());
 
             let deadline = std::time::Instant::now() + Duration::from_secs(60);
@@ -750,12 +765,14 @@ impl App {
             if late_subs {
                 opts.ipc = Some(temp_dir.join("mpv.sock"));
             } else if let Some(pending) = &subtitles {
+                playback.stage(Stage::Subtitles);
                 let _ = tx.send("⧗ looking for subtitles…".into());
                 opts.subtitles = pending.recv_timeout(SUBTITLE_WAIT).unwrap_or_default();
             }
 
             match spawn_player(&player_cmd, &url, &title, &opts) {
                 Ok(mut child) => {
+                    playback.follow(opts.ipc.clone());
                     if let (true, Some(pending), Some(sock)) = (late_subs, subtitles, opts.ipc.clone()) {
                         attach_subtitles_later(sock, pending, tx.clone());
                     }
@@ -767,6 +784,7 @@ impl App {
                         temp_dir.display()
                     ));
                     child.wait().ok();
+                    drop(playback);
                     client.forget(id).ok();
                     stream_ids.lock().unwrap().remove(&id);
                     let cleaned = std::fs::remove_dir_all(&temp_dir).is_ok();
@@ -1410,13 +1428,21 @@ impl App {
         let tx = self.status_tx.clone();
         let stream_ids = Arc::clone(&self.stream_ids);
         let title = file_name.clone();
-        let opts = PlayOpts::resuming(progress::torrent_key(&preview.target, file_idx));
+        let mut opts = PlayOpts::resuming(progress::torrent_key(&preview.target, file_idx));
+        opts.ipc = player_socket(&player_cmd);
+        let playback = self.now_playing.begin(&title, Stage::Starting);
+        playback.torrent(id);
 
         match spawn_player(&player_cmd, &url, &title, &opts) {
             Ok(mut child) => {
                 self.status = format!("▶ streaming: {}{}", title, opts.resume_note());
+                playback.follow(opts.ipc.clone());
                 thread::spawn(move || {
                     child.wait().ok();
+                    drop(playback);
+                    if let Some(sock) = &opts.ipc {
+                        std::fs::remove_file(sock).ok();
+                    }
                     client.forget(id).ok();
                     stream_ids.lock().unwrap().remove(&id);
                     std::fs::remove_dir_all(&temp_dir).ok();
@@ -2109,34 +2135,28 @@ impl App {
         let tx = self.status_tx.clone();
         let headers = stream.headers().to_vec();
         let pending = subs.spawn();
+        let playback = self.now_playing.begin(&label, Stage::Starting);
         thread::spawn(move || {
             let mut opts = PlayOpts::resuming(progress::url_key(&url));
             opts.headers = headers;
             // As above: mpv starts now and hears about subtitles when they come.
-            let late_subs = takes_subtitles_later(&player_cmd);
-            // One socket per playback, so two at once don't talk over each other.
-            let sock = std::env::temp_dir().join(format!(
-                "torflix-mpv-{}-{}.sock",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis())
-                    .unwrap_or(0)
-            ));
-            if late_subs {
-                std::fs::remove_file(&sock).ok();
-                opts.ipc = Some(sock.clone());
-            } else {
+            opts.ipc = player_socket(&player_cmd);
+            if opts.ipc.is_none() {
+                playback.stage(Stage::Subtitles);
                 opts.subtitles = pending.recv_timeout(SUBTITLE_WAIT).unwrap_or_default();
             }
             match spawn_player(&player_cmd, &url, &label, &opts) {
                 Ok(mut child) => {
-                    if late_subs {
-                        attach_subtitles_later(sock.clone(), pending, tx.clone());
+                    playback.follow(opts.ipc.clone());
+                    if let Some(sock) = opts.ipc.clone() {
+                        attach_subtitles_later(sock, pending, tx.clone());
                     }
                     let _ = tx.send(format!("▶ playing: {label}{}{}", opts.resume_note(), subtitle_note(&opts)));
                     child.wait().ok();
-                    std::fs::remove_file(&sock).ok();
+                    drop(playback);
+                    if let Some(sock) = &opts.ipc {
+                        std::fs::remove_file(sock).ok();
+                    }
                     let _ = tx.send(format!("✓ done: {label}"));
                 }
                 Err(e) => {
@@ -2257,12 +2277,13 @@ impl App {
             self.status = "✗ no player found — install mpv or vlc".into();
             return;
         };
-        match spawn_player(&player_cmd, &channel.url, &channel.name, &PlayOpts::default()) {
-            Ok(mut child) => {
+        let opts = PlayOpts { ipc: player_socket(&player_cmd), ..PlayOpts::default() };
+        let playback = self.now_playing.begin(&channel.name, Stage::Starting);
+        match spawn_player(&player_cmd, &channel.url, &channel.name, &opts) {
+            Ok(child) => {
                 self.status = format!("▶ live: {}", channel.name);
-                thread::spawn(move || {
-                    child.wait().ok();
-                });
+                playback.follow(opts.ipc.clone());
+                see_out(child, playback, opts.ipc);
             }
             Err(e) => self.status = format!("✗ couldn't launch '{player_cmd}': {e}"),
         }
@@ -2937,6 +2958,31 @@ fn takes_subtitles_later(player_cmd: &str) -> bool {
             .unwrap_or(false)
 }
 
+/// A fresh IPC socket for this playback, when the player can listen on one.
+/// One per playback, so two at once don't talk over each other.
+fn player_socket(player_cmd: &str) -> Option<std::path::PathBuf> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if !takes_subtitles_later(player_cmd) {
+        return None;
+    }
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let sock = std::env::temp_dir().join(format!("torflix-mpv-{}-{n}.sock", std::process::id()));
+    std::fs::remove_file(&sock).ok();
+    Some(sock)
+}
+
+/// Wait for the player in the background, then take it off the panel and
+/// tidy its socket away.
+fn see_out(mut child: std::process::Child, playback: playing::Playback, ipc: Option<std::path::PathBuf>) {
+    thread::spawn(move || {
+        child.wait().ok();
+        drop(playback);
+        if let Some(sock) = ipc {
+            std::fs::remove_file(sock).ok();
+        }
+    });
+}
+
 /// Hand subtitles to a player that has already started.
 ///
 /// mpv takes `--sub-file` only on its command line, so waiting for the
@@ -2957,7 +3003,7 @@ fn attach_subtitles_later(
             return;
         }
         // mpv creates the socket a moment after it starts.
-        let Some(mut pipe) = connect_to_player(&sock) else {
+        let Some(mut pipe) = playing::connect_to_player(&sock) else {
             let _ = tx.send("⚠ subtitles found, but mpv didn't answer — press j to cycle".into());
             return;
         };
@@ -2976,24 +3022,6 @@ fn attach_subtitles_later(
             if files.len() == 1 { "" } else { "s" }
         ));
     });
-}
-
-/// Wait for mpv to create its IPC socket, then open it.
-#[cfg(unix)]
-fn connect_to_player(sock: &std::path::Path) -> Option<std::os::unix::net::UnixStream> {
-    let deadline = std::time::Instant::now() + PLAYER_IPC_WAIT;
-    while std::time::Instant::now() < deadline {
-        if let Ok(stream) = std::os::unix::net::UnixStream::connect(sock) {
-            return Some(stream);
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    None
-}
-
-#[cfg(not(unix))]
-fn connect_to_player(_sock: &std::path::Path) -> Option<std::fs::File> {
-    None
 }
 
 fn spawn_player(player_cmd: &str, url: &str, title: &str, opts: &PlayOpts) -> std::io::Result<std::process::Child> {

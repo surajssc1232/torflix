@@ -7,6 +7,7 @@ mod history;
 mod letterboxd;
 mod omdb;
 mod picker;
+mod playing;
 mod posters;
 mod progress;
 mod rqbit;

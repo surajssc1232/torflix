@@ -1,5 +1,6 @@
 use crate::app::{human_bytes, is_video, poster_url, progress_size, HomeFocus, App, Placed, Details, FileSortMode, InputPurpose, Load, Pane, PreviewState, SearchPreview, SearchStatus, SortMode, View};
 use crate::history;
+use crate::playing::{NowPlaying, Stage};
 use crate::picker;
 use crate::posters;
 use crate::stremio::MetaItem;
@@ -498,6 +499,28 @@ fn draw_files(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_status(f: &mut Frame, area: Rect, app: &App) {
+    if let Some(np) = app.now_playing.snapshot() {
+        let stats = np
+            .torrent
+            .and_then(|id| app.rows_snapshot().into_iter().find(|r| r.id == id))
+            .and_then(|r| r.stats);
+        // On its way: how far, in place of the status, until the first frame.
+        if let Some(loading) = loading_line(&np, stats.as_ref()) {
+            let line = Span::styled(format!(" {loading}"), Style::default().fg(YELLOW));
+            f.render_widget(Paragraph::new(line), area);
+            return;
+        }
+        // Playing: the status as usual, with where you are at the right.
+        if let Some((clock, color)) = playing_clock(&np) {
+            let width = clock.chars().count() as u16 + 1;
+            let (text, style) = status_style(&app.status);
+            let room = area.width.saturating_sub(width + 2) as usize;
+            f.render_widget(Paragraph::new(Span::styled(format!(" {}", clip(&text, room)), style)), area);
+            let right = Rect { x: area.x + area.width.saturating_sub(width), width: width.min(area.width), ..area };
+            f.render_widget(Paragraph::new(Span::styled(clock, Style::default().fg(color))), right);
+            return;
+        }
+    }
     let (text, style) = if app.view == View::SearchResults {
         let r = app.search_ratings_line();
         if !r.is_empty() { (r, Style::default().fg(AQUA)) } else { status_style(&app.status) }
@@ -508,6 +531,36 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         Paragraph::new(Span::styled(format!(" {}", text), style)),
         area,
     );
+}
+
+/// "⧗ loading 37% · finding peers · 12 peers, 1.2 MiB/s — Inception (2010)",
+/// from Enter until the first frame is up; `None` once it is.
+fn loading_line(np: &NowPlaying, stats: Option<&crate::rqbit::TorrentStats>) -> Option<String> {
+    if np.stage >= Stage::Playing {
+        return None;
+    }
+    let mut parts = vec![format!("⧗ loading {}%", np.percent()), np.stage.label().to_string()];
+    if let Some(s) = stats.filter(|_| matches!(np.stage, Stage::Metadata | Stage::Starting)) {
+        let peers = s.peers();
+        parts.push(format!("{peers} peer{}, {}", if peers == 1 { "" } else { "s" }, s.down_speed()));
+    }
+    Some(format!("{} — {}", parts.join(" · "), np.title))
+}
+
+/// "▶ 12:34 / 2:28:00" while it plays, or what's holding it up.
+fn playing_clock(np: &NowPlaying) -> Option<(String, Color)> {
+    let clock = crate::app::format_clock;
+    let p = &np.player;
+    if p.stalled {
+        let pct = p.buffer_pct.map(|n| format!(" {n}%")).unwrap_or_default();
+        return Some((format!("⧗ buffering{pct} "), YELLOW));
+    }
+    let pos = clock(p.position? as u64);
+    let at = match p.duration {
+        Some(d) => format!("{pos} / {}", clock(d as u64)),
+        None => pos,
+    };
+    Some(if p.paused { (format!("❚❚ {at} "), GRAY) } else { (format!("▶ {at} "), GREEN) })
 }
 
 fn status_style(status: &str) -> (String, Style) {
@@ -1554,5 +1607,51 @@ fn draw_preview_panel(f: &mut Frame, area: Rect, preview: &SearchPreview) {
             list_state.select(Some(preview.file_selected.min(files.len().saturating_sub(1))));
             f.render_stateful_widget(list, area, &mut list_state);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::playing::Slot;
+
+    fn stats(json: &str) -> crate::rqbit::TorrentStats {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn loading_shows_how_far_until_the_first_frame() {
+        let slot = Slot::default();
+        let pb = slot.begin("Inception (2010)", Stage::Adding);
+        assert_eq!(
+            loading_line(&slot.snapshot().unwrap(), None).unwrap(),
+            "⧗ loading 2% · adding torrent — Inception (2010)"
+        );
+        pb.torrent(7);
+        pb.stage(Stage::Metadata);
+        let s = stats(r#"{"state":"live","live":{"snapshot":{"peer_stats":{"live":12}},"download_speed":{"human_readable":"1.2 MiB/s"}}}"#);
+        assert_eq!(
+            loading_line(&slot.snapshot().unwrap(), Some(&s)).unwrap(),
+            "⧗ loading 5% · finding peers · 12 peers, 1.2 MiB/s — Inception (2010)"
+        );
+        pb.stage(Stage::Playing);
+        assert_eq!(loading_line(&slot.snapshot().unwrap(), Some(&s)), None);
+    }
+
+    #[test]
+    fn playing_shows_where_you_are() {
+        let slot = Slot::default();
+        let _pb = slot.begin("x", Stage::Playing);
+        let mut np = slot.snapshot().unwrap();
+        // Nothing from the player (VLC): nothing to say.
+        assert_eq!(playing_clock(&np), None);
+        np.player.position = Some(754.0);
+        np.player.duration = Some(8880.0);
+        assert_eq!(playing_clock(&np).unwrap().0, "▶ 12:34 / 2:28:00 ");
+        np.player.paused = true;
+        assert_eq!(playing_clock(&np).unwrap().0, "❚❚ 12:34 / 2:28:00 ");
+        np.player.stalled = true;
+        np.player.buffer_pct = Some(43);
+        assert_eq!(playing_clock(&np).unwrap().0, "⧗ buffering 43% ");
     }
 }

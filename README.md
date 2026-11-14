@@ -247,6 +247,8 @@ Each download gets its own folder named after the title — `~/Downloads/torflix
 
 When streaming from a multi-file torrent (a season pack, say), torflix fetches only the episode you're watching, so the rest of the pack doesn't compete with it for peers and bandwidth.
 
+**Loading progress**: from the moment you press Enter until the movie is on screen, the status bar shows how far along it is — `⧗ loading 37% · finding peers · 12 peers, 1.2 MiB/s — Inception (2010)` — and once the first frame is up it shows where you are, `▶ 12:34 / 2:28:00`, at the right (or `❚❚` paused, `⧗ buffering` when it's waiting on data). Finding peers can't be measured, so the number creeps along through it; it only reaches 100% when mpv is actually playing. VLC doesn't report back, so with VLC it shows playing as soon as the player opens.
+
 ## Catalog mode, subtitles & resume
 
 Press `Ctrl+P` on the home screen to search the **catalog** instead of torrent indexers. It uses [Stremio addons](https://github.com/Stremio/stremio-addon-sdk): titles, posters and ratings come from Cinemeta, and a series opens with its seasons and episodes.
