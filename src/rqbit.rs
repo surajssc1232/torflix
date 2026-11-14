@@ -196,19 +196,35 @@ impl Client {
     /// Add a magnet link, an http(s) URL to a .torrent, or a local .torrent path.
     /// Returns the assigned torrent ID.
     pub fn add(&self, magnet_url_or_path: &str) -> Result<u64> {
-        self.add_inner(magnet_url_or_path, None)
+        self.add_inner(magnet_url_or_path, None, None)
     }
 
     /// Like `add`, but tells rqbit to download pieces into `output_folder`
     /// instead of the engine's default download directory.
     pub fn add_to_dir(&self, magnet_url_or_path: &str, output_folder: &Path) -> Result<u64> {
-        self.add_inner(magnet_url_or_path, Some(output_folder))
+        self.add_inner(magnet_url_or_path, Some(output_folder), None)
     }
 
-    fn add_inner(&self, magnet_url_or_path: &str, output_folder: Option<&Path>) -> Result<u64> {
+    /// Like `add_to_dir`, fetching only file `only` (original rqbit index) from
+    /// the start. Narrowing it afterwards leaves a window where the whole torrent
+    /// downloads: rqbit refuses to change the files while it's initializing.
+    /// Falls back to the whole torrent if rqbit rejects the index.
+    pub fn add_to_dir_only(&self, magnet_url_or_path: &str, output_folder: &Path, only: Option<usize>) -> Result<u64> {
+        match only {
+            Some(i) => self
+                .add_inner(magnet_url_or_path, Some(output_folder), Some(i))
+                .or_else(|_| self.add_inner(magnet_url_or_path, Some(output_folder), None)),
+            None => self.add_inner(magnet_url_or_path, Some(output_folder), None),
+        }
+    }
+
+    fn add_inner(&self, magnet_url_or_path: &str, output_folder: Option<&Path>, only: Option<usize>) -> Result<u64> {
         // One add at a time: see ADD_LOCK.
         let _adding = ADD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let url = add_url(&self.base, output_folder);
+        let mut url = add_url(&self.base, output_folder);
+        if let Some(i) = only {
+            url.push_str(&format!("&only_files={i}"));
+        }
         let input = magnet_url_or_path.trim();
         let req = if Path::new(input).is_file() {
             let bytes = std::fs::read(input)?;
@@ -251,20 +267,27 @@ impl Client {
     /// Download only these files (original rqbit indices). Streaming one episode
     /// out of a season pack otherwise pulls every episode at once, and they all
     /// compete with the one being watched for bandwidth and peers.
+    ///
+    /// rqbit refuses while a torrent is still initializing — which is right
+    /// after it's added, exactly when this is wanted — so that is waited out.
+    /// Blocks for up to [`ONLY_FILES_WAIT`]; call it off the draw thread.
     pub fn update_only_files(&self, id: u64, files: &[usize]) -> Result<()> {
-        let resp = minreq::post(&format!("{}/torrents/{}/update_only_files", self.base, id))
-            .with_json(&serde_json::json!({ "only_files": files }))?
-            .with_timeout(10)
-            .send()
-            .context("could not reach the rqbit engine")?;
-        if resp.status_code >= 400 {
-            return Err(anyhow!(
-                "HTTP {}: {}",
-                resp.status_code,
-                snip(resp.as_str().unwrap_or(""), 120)
-            ));
+        let deadline = std::time::Instant::now() + ONLY_FILES_WAIT;
+        loop {
+            let resp = minreq::post(&format!("{}/torrents/{}/update_only_files", self.base, id))
+                .with_json(&serde_json::json!({ "only_files": files }))?
+                .with_timeout(10)
+                .send()
+                .context("could not reach the rqbit engine")?;
+            if resp.status_code < 400 {
+                return Ok(());
+            }
+            let body = resp.as_str().unwrap_or("").to_string();
+            if !body.contains("initializing") || std::time::Instant::now() >= deadline {
+                return Err(anyhow!("HTTP {}: {}", resp.status_code, snip(&body, 120)));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
         }
-        Ok(())
     }
 
     fn post(&self, path: &str) -> Result<()> {
@@ -296,6 +319,9 @@ impl Client {
 /// same id, and the second comes back as "already managed" — reported as a
 /// success, but never actually added. Queue them instead.
 static ADD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// How long `update_only_files` waits for a torrent to finish initializing.
+const ONLY_FILES_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The add-torrent URL. The folder has to be percent-encoded: download folders are
 /// named after the title, and a raw space makes the request line invalid (HTTP 400).
@@ -490,6 +516,34 @@ mod tests {
         // A permanent download dir that merely happens to be named torflix-*.
         assert!(!is_temp_folder(Path::new("/home/someone/Videos/torflix-stuff")));
         assert!(!is_temp_folder(&tmp.join("torflix-1").join("nested")));
+    }
+
+    /// Streaming one episode of a pack must fetch only that episode, even when
+    /// asked for while the torrent is still initializing — rqbit turns that down,
+    /// and swallowing the refusal used to leave the whole pack downloading.
+    /// Needs an engine with nothing else on it and a two-file torrent whose
+    /// first file is already in the folder, so initializing takes a while:
+    /// TORFLIX_TEST_ENGINE, TORFLIX_TEST_TORRENT, TORFLIX_TEST_DIR.
+    #[test]
+    #[ignore = "needs a test engine and torrent, see the comment"]
+    fn narrows_to_one_file_even_while_initializing() {
+        let var = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("{k} not set"));
+        let c = Client::new(&var("TORFLIX_TEST_ENGINE"));
+        let (torrent, dir) = (var("TORFLIX_TEST_TORRENT"), std::path::PathBuf::from(var("TORFLIX_TEST_DIR")));
+        let included = |id| c.details(id).unwrap().files.iter().filter(|f| f.included).count();
+
+        // Narrowed straight after the add, while it's still initializing. First,
+        // while the engine hasn't seen the files: once checked, they aren't again.
+        let id = c.add_to_dir(&torrent, &dir).unwrap();
+        assert_eq!(c.stats(id).unwrap().state, "initializing", "the test needs initializing to take a while");
+        c.update_only_files(id, &[1]).unwrap();
+        assert_eq!(included(id), 1);
+        c.forget(id).unwrap();
+
+        // Named at add time: only that file, from the start.
+        let id = c.add_to_dir_only(&torrent, &dir, Some(1)).unwrap();
+        assert_eq!(included(id), 1);
+        c.forget(id).unwrap();
     }
 
     /// Integration test against a live local rqbit engine.

@@ -708,7 +708,9 @@ impl App {
             ));
             std::fs::create_dir_all(&temp_dir).ok();
 
-            let id = match client.add_to_dir(&target, &temp_dir) {
+            // When the stream names its file, only that one is fetched from the
+            // start, instead of the whole pack until it can be narrowed.
+            let id = match client.add_to_dir_only(&target, &temp_dir, extras.file_idx) {
                 Ok(id) => id,
                 Err(e) => {
                     let _ = tx.send(format!("✗ add failed: {}", e));
@@ -754,9 +756,19 @@ impl App {
                 return;
             };
 
-            // Fetch just this file — the rest of a pack would compete with it for peers.
-            client.update_only_files(id, &[idx]).ok();
+            // Fetch just this file — the rest of a pack would compete with it for
+            // peers. Already so when it was named at add time; otherwise narrow it
+            // now, alongside starting the player rather than before it.
+            if extras.file_idx != Some(idx) || details.files.iter().filter(|f| f.included).count() > 1 {
+                let (client, tx) = (client.clone(), tx.clone());
+                thread::spawn(move || {
+                    if let Err(e) = client.update_only_files(id, &[idx]) {
+                        let _ = tx.send(format!("⚠ couldn't limit the download to this file, so the whole torrent is coming: {e}"));
+                    }
+                });
+            }
             let url = client.stream_url(id, idx);
+            warm_tail(&url, file.length);
             let title = file.name.clone();
             let mut opts = PlayOpts::resuming(progress::torrent_key(&target, idx));
             // mpv is started straight away and told about subtitles later over
@@ -1185,10 +1197,19 @@ impl App {
         self.status = format!("⬇ queuing: {} → {}", label, dest.display());
         thread::spawn(move || {
             std::fs::create_dir_all(&dest).ok();
-            match client.add_to_dir(&target, &dest) {
+            match client.add_to_dir_only(&target, &dest, file_idx) {
                 Ok(id) => {
+                    // Already so unless rqbit turned the index down at add time.
                     if let Some(idx) = file_idx {
-                        client.update_only_files(id, &[idx]).ok();
+                        let narrowed = client
+                            .details(id)
+                            .map(|d| d.files.iter().filter(|f| f.included).count() <= 1)
+                            .unwrap_or(false);
+                        if !narrowed {
+                            if let Err(e) = client.update_only_files(id, &[idx]) {
+                                let _ = tx.send(format!("⚠ couldn't limit the download to the one file: {e}"));
+                            }
+                        }
                     }
                     let _ = tx.send(format!("⬇ downloading: {}  →  {}", label, dest.display()));
                 }
@@ -1386,21 +1407,21 @@ impl App {
                 Some(id) => id,
                 None => return,
             };
-            let (idx, name) = match &*preview.state.lock().unwrap() {
+            let (idx, name, len) = match &*preview.state.lock().unwrap() {
                 PreviewState::Ready(files) => {
                     // Sort the same way the UI displays them so file_selected
                     // maps to the correct visual row and original rqbit index.
                     let sorted = Self::preview_sorted_files(files, &preview.file_sort);
                     match sorted.get(preview.file_selected) {
-                        Some((orig_idx, f)) => (*orig_idx, f.name.clone()),
+                        Some((orig_idx, f)) => (*orig_idx, f.name.clone(), f.length),
                         None => return,
                     }
                 }
                 _ => return,
             };
-            (id, idx, name)
+            (id, idx, name, len)
         };
-        let (id, file_idx, file_name) = data;
+        let (id, file_idx, file_name, file_len) = data;
 
         // Promote the preview to a live stream — take ownership so cleanup doesn't double-forget
         let preview = self.search_preview.take().unwrap();
@@ -1421,9 +1442,18 @@ impl App {
             return;
         };
 
-        // Switch the fetch over to the file they picked, and only that file.
-        self.client.update_only_files(id, &[file_idx]).ok();
+        // Switch the fetch over to the file they picked, and only that file. It
+        // can wait for the torrent to initialize, so not on the draw thread.
+        {
+            let (client, tx) = (self.client.clone(), self.status_tx.clone());
+            thread::spawn(move || {
+                if let Err(e) = client.update_only_files(id, &[file_idx]) {
+                    let _ = tx.send(format!("⚠ couldn't limit the download to this file: {e}"));
+                }
+            });
+        }
         let url = self.client.stream_url(id, file_idx);
+        warm_tail(&url, file_len);
         let client = self.client.clone();
         let tx = self.status_tx.clone();
         let stream_ids = Arc::clone(&self.stream_ids);
@@ -2794,6 +2824,26 @@ fn warm_stream(url: &str) {
             .with_header("Range", "bytes=0-1048575")
             .with_timeout(30)
             .send();
+    });
+}
+
+/// How much of the end of a file to fetch before the player asks for it.
+const TAIL_WARM: u64 = 4 << 20;
+
+/// Ask rqbit for the end of the file as well as the start. Many mp4s keep their
+/// index (`moov`) after the video, and mkv keeps its seek index there too: the
+/// player can't show a frame until it has read it, so it reads the end of the
+/// file before anything else. Torrent pieces can be 8 MiB or more, so fetching
+/// the last one only when the player asks was most of the wait between the
+/// player opening and the picture appearing.
+fn warm_tail(url: &str, len: u64) {
+    if len == 0 {
+        return;
+    }
+    let range = format!("bytes={}-{}", len.saturating_sub(TAIL_WARM), len - 1);
+    let url = url.to_string();
+    thread::spawn(move || {
+        let _ = minreq::get(&url).with_header("Range", range).with_timeout(120).send();
     });
 }
 
